@@ -34,6 +34,7 @@ curl -fsSL https://raw.githubusercontent.com/hexoblog-web-site/beacon-monitor/ma
 - [友链与友圈](#友链与友圈)
 - [配置项](#配置项)
 - [通知](#通知)
+- [从 Glue 迁移](#从-glue-迁移)
 - [自动更新](#自动更新)
 - [运维](#运维)
 - [常见问题](#常见问题)
@@ -650,6 +651,60 @@ https://status.你的域名/apply
 | 飞书机器人 | `https://open.feishu.cn/open-apis/bot/v2/hook/xxx` |
 | 钉钉机器人 | `https://oapi.dingtalk.com/robot/send?access_token=xxx` |
 | 自定义 | 任意 URL，POST `{ event, title, body, monitor, result }` |
+
+## 从 Glue 迁移
+
+Glue 是之前那套 PHP 点赞服务（Nginx + PHP-FPM + MySQL）。Beacon 把它整个接过来：点赞、浏览量、收藏、有用没用，加上友链和朋友圈。历史点赞可以完整搬过去，不是只搬个总数。
+
+### 一条命令
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hexoblog-web-site/beacon-monitor/main/tools/migrate-from-glue.sh | bash
+```
+
+脚本会自己找容器、读库密码、导出数据、停 Glue、起 Beacon、导入、体检，任何一步失败自动把 Glue 拉回来。
+
+| 步骤 | 做什么 | 会不会伤到原数据 |
+| --- | --- | --- |
+| 1 | 从 `zan-db` 导出 `zan_log` / `zan_page` | 只读查询 |
+| 2 | `docker stop zan`（容器保留） | 不删、不重建、不碰数据卷 |
+| 3 | 同端口起 Beacon | 反代指向没变，域名不用改 |
+| 4 | 明细写进 SQLite | 一人一篇一条，幂等，可重复跑 |
+
+端口默认沿用 Glue 当前对外那个，所以 Nginx 反代里写的 `proxy_pass http://127.0.0.1:8080` 不用动。
+
+### ⚠️ 不要这么做
+
+把 Beacon 的文件推到 Glue 仓库，然后在 Glue 后台点「更新」——**站会直接 500，而且后台也没了，想回滚都点不到**。
+
+原因在 Glue 的更新器（`include/updater.php`）：它下载仓库 zip、解压覆盖 `/var/www/html` 的程序区，**只换文件，不换运行时**。覆盖完目录里全是 `.js`，而容器里跑的还是 `php:8.3-fpm` + nginx，找不到 `index.php` 就白屏。升级镜像才是换运行时的唯一办法，那一步只能在宿主机做。
+
+### 迁移完
+
+1. 后台 → 互动统计，确认每篇的赞数对得上
+2. 博客里把旧的 Glue 地址换成 Beacon 的 `/e.js`
+3. 之后升级都在 Beacon 后台点，不用再登服务器
+
+### 想退回去
+
+Glue 的容器和数据卷都还在：
+
+```bash
+docker compose -f /opt/beacon-monitor/docker-compose.yml down
+docker start zan
+```
+
+### 只迁数据，不换程序
+
+已经装好 Beacon、只想补数据：
+
+```bash
+bash tools/migrate-from-glue.sh        # 导出到 /opt/beacon-monitor/data/glue-migrate
+docker exec beacon-monitor node tools/import-glue.js /data/glue-migrate --dry-run
+docker exec beacon-monitor node tools/import-glue.js /data/glue-migrate
+```
+
+`--dry-run` 只数不写，先看一眼有多少条再决定。
 
 ## 运维
 

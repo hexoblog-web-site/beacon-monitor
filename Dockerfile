@@ -33,6 +33,7 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY package.json ./
 COPY server ./server
 COPY public ./public
+COPY tools ./tools
 
 RUN chown -R node:node /app
 USER node
