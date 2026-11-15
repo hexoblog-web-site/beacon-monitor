@@ -719,7 +719,8 @@ cd /opt/beacon-monitor && bash update.sh
 
 - 灰绿点 = 已是最新
 - 橙点 + 横幅 = 有新版本，横幅里直接给了可复制的更新命令和 Release 说明链接
-- 检查走 GitHub Releases API（失败自动换 jsDelivr → raw），结果缓存 30 分钟，不会每次都打接口
+- 检查走 GitHub Releases API，失败自动换 GitHub Contents API → jsDelivr → raw，结果缓存 30 分钟，不会每次都打接口
+- 国内服务器访问 raw 常年不稳，所以中间加了一层  读 ，无 CDN 缓存，是实际最常命中的来源
 
 ![更新提示](docs/preview-update-manual.png)
 
@@ -785,7 +786,7 @@ beacon-monitor/
 │   ├── checker.js    # HTTP 检测 / 证书剩余天数 / 状态判定
 │   ├── scheduler.js  # 调度、并发控制、状态翻转通知
 │   ├── discovery.js  # 自动发现（Docker API + 端口探测）
-│   ├── updater.js    # 新版本检测（Releases API → jsDelivr → raw）
+│   ├── updater.js    # 新版本检测（Releases → Contents API → jsDelivr → raw）
 │   └── version.js    # 版本号 / 仓库 / 镜像名
 ├── public/
 │   ├── index.html    # 公开状态页

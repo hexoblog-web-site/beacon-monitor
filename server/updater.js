@@ -6,10 +6,11 @@
  *   - watchtower（推荐，全自动）
  *   - update.sh（手动一条命令）
  *
- * 依次尝试三个来源，避免国内服务器访问 raw.githubusercontent.com 不稳：
- *   1. GitHub Releases API（有发版记录时信息最全）
- *   2. jsDelivr CDN 上的 package.json（国内可访问）
- *   3. raw.githubusercontent.com（最后兜底）
+ * 依次尝试四个来源，按可靠性排序，任一成功即止：
+ *   1. GitHub Releases API（发了 Release 时信息最全，含更新说明）
+ *   2. GitHub Contents API（读 main 的 package.json，无 CDN 缓存，api.github.com 国内比 raw 稳）
+ *   3. jsDelivr CDN（国内快，但 main 分支有缓存延迟，可能读到旧版本）
+ *   4. raw.githubusercontent.com（最后兜底，国内经常不通）
  */
 
 const { VERSION, REPO, IMAGE } = require('./version');
@@ -75,6 +76,33 @@ async function getJson(url) {
   }
 }
 
+/** 取纯文本（GitHub Contents API 用 raw media type 直接返回文件内容） */
+async function getText(url, accept) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT);
+  try {
+    const headers = {
+      'user-agent': 'BeaconMonitor-UpdateCheck',
+      accept: accept || 'text/plain',
+    };
+    if (process.env.GITHUB_TOKEN) {
+      headers.authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
+    }
+    const res = await fetch(url, { headers, signal: controller.signal });
+    if (!res.ok) {
+      const err = new Error(`HTTP ${res.status}`);
+      err.status = res.status;
+      throw err;
+    }
+    return await res.text();
+  } catch (err) {
+    if (err.name === 'AbortError') err.timeout = true;
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 const SOURCES = [
   async function fromRelease() {
     const release = await getJson(`https://api.github.com/repos/${REPO}/releases/latest`);
@@ -86,6 +114,21 @@ const SOURCES = [
       publishedAt: release.published_at ? Date.parse(release.published_at) : null,
       notes: String(release.body || '').slice(0, 1200),
       source: 'release',
+    };
+  },
+  async function fromContents() {
+    const text = await getText(
+      `https://api.github.com/repos/${REPO}/contents/package.json?ref=main`,
+      'application/vnd.github.raw'
+    );
+    const latest = normalize(JSON.parse(text).version);
+    if (!latest) throw new Error('no version');
+    return {
+      latest,
+      url: `https://github.com/${REPO}`,
+      publishedAt: null,
+      notes: '',
+      source: 'github',
     };
   },
   async function fromJsdelivr() {
