@@ -774,24 +774,34 @@ app.get('/api/e/friends.json', (req, res) => {
  * Butterfly 主题的友链页可以直吃这个接口。
  * 页面 front-matter 写 flink_url 指向这里，主题自己渲染，link.yml 就彻底不用了。
  * 字段名必须贴合主题的 link.yml 结构：link / name / avatar / descr。
+ * 按 friend_link.group_name 分组输出：数组里每一项是一个分组（class_name + link_list），
+ * 顺序以「第一条友链所属分组」出现先后为准，与后台分组管理一致。
  * class_name 必须存在（哪怕是空串），否则主题里的 replaceSymbol(undefined) 会抛错。
  */
 app.get('/api/e/link.json', (req, res) => {
   res.set('cache-control', 'public, max-age=300');
-  const group = String(db.getSetting('friend_group_name') || '');
-  const groupDesc = String(db.getSetting('friend_group_desc') || '');
-  res.json([
-    {
-      class_name: group,
-      class_desc: groupDesc,
-      link_list: friends.publicLinks().map((l) => ({
-        link: l.url,
-        name: l.name,
-        avatar: l.avatar || '',
-        descr: l.desc || '',
-      })),
-    },
-  ]);
+  const links = friends.publicLinks();
+  const order = [];
+  const map = new Map();
+  for (const l of links) {
+    const g = (l.group_name && l.group_name.trim()) || '未分组';
+    if (!map.has(g)) {
+      map.set(g, []);
+      order.push(g);
+    }
+    map.get(g).push({
+      link: l.url,
+      name: l.name,
+      avatar: l.avatar || '',
+      descr: l.desc || '',
+    });
+  }
+  const groups = order.map((name) => ({
+    class_name: name,
+    class_desc: '',
+    link_list: map.get(name),
+  }));
+  res.json(groups);
 });
 
 app.get('/api/e/moments.json', (req, res) => {

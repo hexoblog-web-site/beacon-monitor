@@ -48,7 +48,35 @@ CREATE TABLE IF NOT EXISTS friend_post (
 
 CREATE INDEX IF NOT EXISTS idx_friend_post_time ON friend_post (published_at DESC);
 CREATE INDEX IF NOT EXISTS idx_friend_post_link ON friend_post (link_id);
-`);
+  `);
+
+// ---------- 轻量迁移：friend_link 增加 group_name 分组列 ----------
+(function migrateFriendLink() {
+  const cols = db.prepare('PRAGMA table_info(friend_link)').all().map((c) => c.name);
+  if (!cols.includes('group_name')) {
+    db.exec("ALTER TABLE friend_link ADD COLUMN group_name TEXT NOT NULL DEFAULT '未分组'");
+  }
+  // 历史数据：从 note 里的「分组:X」回填（仅处理仍是默认分组的行，幂等可重复执行）
+  const rows = db
+    .prepare(
+      "SELECT id, note FROM friend_link WHERE (group_name IS NULL OR group_name = '未分组') AND note LIKE '%分组:%'"
+    )
+    .all();
+  if (!rows.length) return;
+  const upd = db.prepare('UPDATE friend_link SET group_name = ? WHERE id = ?');
+  const tx = db.transaction(() => {
+    for (const r of rows) {
+      const i = r.note.indexOf('分组:');
+      if (i < 0) continue;
+      let g = r.note.slice(i + 3);
+      const bar = g.indexOf(' | ');
+      if (bar >= 0) g = g.slice(0, bar);
+      g = g.trim();
+      if (g) upd.run(g, r.id);
+    }
+  });
+  tx();
+})();
 
 const STATUSES = ['pending', 'approved', 'rejected'];
 
@@ -112,6 +140,7 @@ function createLink(input) {
     desc: cleanStr(input.desc, 120) || null,
     email: cleanStr(input.email, 120) || null,
     rss: cleanStr(input.rss, 300) || null,
+    group_name: cleanStr(input.group_name, 40) || '未分组',
     status: STATUSES.includes(input.status) ? input.status : 'pending',
     note: cleanStr(input.note, 200) || null,
     created_at: Date.now(),
@@ -120,8 +149,8 @@ function createLink(input) {
 
   const info = db
     .prepare(
-      `INSERT INTO friend_link (name, url, avatar, desc, email, rss, status, note, created_at, reviewed_at)
-       VALUES (@name, @url, @avatar, @desc, @email, @rss, @status, @note, @created_at, @reviewed_at)`
+      `INSERT INTO friend_link (name, url, avatar, desc, email, rss, group_name, status, note, created_at, reviewed_at)
+       VALUES (@name, @url, @avatar, @desc, @email, @rss, @group_name, @status, @note, @created_at, @reviewed_at)`
     )
     .run(row);
 
@@ -140,13 +169,14 @@ function updateLink(id, input) {
     desc: cleanStr(input.desc ?? current.desc, 120) || null,
     email: cleanStr(input.email ?? current.email, 120) || null,
     rss: cleanStr(input.rss ?? current.rss, 300) || null,
+    group_name: cleanStr(input.group_name ?? current.group_name, 40) || '未分组',
     note: cleanStr(input.note ?? current.note, 200) || null,
   };
 
   db.prepare(
     `UPDATE friend_link
         SET name = @name, url = @url, avatar = @avatar, desc = @desc,
-            email = @email, rss = @rss, note = @note
+            email = @email, rss = @rss, group_name = @group_name, note = @note
       WHERE id = @id`
   ).run(merged);
 
@@ -356,7 +386,7 @@ function trimPosts() {
 function publicLinks() {
   return db
     .prepare(
-      `SELECT name, url, avatar, desc FROM friend_link
+      `SELECT name, url, avatar, desc, group_name FROM friend_link
         WHERE status = 'approved' ORDER BY created_at ASC`
     )
     .all();
