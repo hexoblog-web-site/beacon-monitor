@@ -1,5 +1,11 @@
 # 落地方案：维护窗口 + 多渠道通知 + 证书到期告警
 
+> **状态：已实现并上线 v1.4.0（commit `8faf705`）**。实际实现与本文档的差异：
+> - 通知日志增加 `ref_key` 列（冷却/去重按 `渠道 + 事件类型 + 引用对象` 分组，比原设计按 monitor_id 更准确）
+> - 渠道默认 `min_level` 取 `info`（保证恢复/维护通知不会被默认过滤）
+> - 维护期「开始/结束」事件由 `maintenance.startWatcher()` 每分钟检查，进程重启不补发历史事件
+> - 证书巡检失败不告警，记录 `fail_count`/`last_error`
+
 > 目标版本：**v1.4.0**（当前 1.3.1，属新增特性，升 minor）
 > 适用范围：beacon-monitor 现有架构（Node 20 + Express + better-sqlite3 单库）
 > 设计原则：**不加新依赖、不加新进程、不改部署方式**；所有新表 `CREATE TABLE IF NOT EXISTS` 自动建，升级时只重建容器即可。
