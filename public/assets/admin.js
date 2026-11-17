@@ -26,7 +26,13 @@
       showLogin();
       throw new Error('登录已过期');
     }
-    if (!res.ok) throw new Error(data.error || `请求失败（${res.status}）`);
+    if (!res.ok) {
+      const err = new Error(data.error || `请求失败（${res.status}）`);
+      err.status = res.status;
+      err.code = data.code;
+      err.existing = data.existing;
+      throw err;
+    }
     return data;
   }
 
@@ -467,6 +473,7 @@
   // ---------- 友链与友圈 ----------
 
   let friends = [];
+  let pendingUpdates = [];
 
   const FRIEND_STATUS = {
     pending: { text: '待审核', cls: 'pill-pending' },
@@ -492,6 +499,7 @@
     try {
       const data = await api('/api/admin/friends');
       friends = data.links || [];
+      pendingUpdates = data.updates || [];
       renderFriendStats(data.stats || {});
       renderFriends();
     } catch (err) {
@@ -502,6 +510,7 @@
   function renderFriendStats(stats) {
     const cells = [
       ['待审核', stats.pending || 0],
+      ['待更新', stats.updates || 0],
       ['已通过', stats.approved || 0],
       ['友圈文章', stats.posts || 0],
       ['抓取失败', stats.broken || 0],
@@ -514,6 +523,38 @@
       .join('');
   }
 
+  function diffText(u) {
+    const bits = [];
+    const cmp = (label, oldV, newV) => {
+      const a = String(oldV == null ? '' : oldV).trim();
+      const b = String(newV == null ? '' : newV).trim();
+      if (b && b !== a) bits.push(`${label}：${a || '—'} → ${b}`);
+    };
+    cmp('名称', u.target_name, u.name);
+    cmp('头像', u.target_avatar, u.avatar);
+    cmp('简介', u.target_desc, u.desc);
+    cmp('RSS', u.target_rss, u.rss);
+    return bits.length ? bits.join('　') : '提交了更新，但与原记录一致';
+  }
+
+  function renderUpdateRow(u) {
+    return `
+      <tr data-upd="${u.id}" class="row-upd">
+        <td>
+          <div class="cell-name">${esc(u.name)} <span class="pill pill-pending">更新</span></div>
+          <a class="cell-url" href="${esc(u.url)}" target="_blank" rel="noopener">${esc(u.url)}</a>
+          <div class="cell-note">${esc(diffText(u))}</div>
+        </td>
+        <td><span class="pill pill-pending">待确认更新</span></td>
+        <td>—</td>
+        <td>—</td>
+        <td class="col-actions"><div class="row-actions">
+          <button class="btn btn-sm btn-primary" data-fact="apply-upd">覆盖</button>
+          <button class="btn btn-sm btn-danger" data-fact="reject-upd">拒绝</button>
+        </div></td>
+      </tr>`;
+  }
+
   function renderFriends() {
     const tbody = $('#friendRows');
     const order = { pending: 0, approved: 1, rejected: 2 };
@@ -521,13 +562,17 @@
       (a, b) => (order[a.status] ?? 3) - (order[b.status] ?? 3) || b.created_at - a.created_at
     );
 
-    if (!list.length) {
+    const updHtml = pendingUpdates.map(renderUpdateRow).join('');
+
+    if (!list.length && !updHtml) {
       tbody.innerHTML =
         '<tr><td colspan="5" class="table-empty">还没有友链，点右上角「添加友链」开始</td></tr>';
       return;
     }
 
-    tbody.innerHTML = list
+    tbody.innerHTML =
+      updHtml +
+      list
       .map((f) => {
         const status = FRIEND_STATUS[f.status] || FRIEND_STATUS.pending;
         const feed = f.feed_state
@@ -584,10 +629,31 @@
     const btn = e.target.closest('button[data-fact]');
     if (!btn) return;
     const tr = btn.closest('tr');
+    const act = btn.dataset.fact;
+
+    // 待确认更新行：覆盖原友链 / 拒绝
+    if (tr.dataset.upd) {
+      const uid = Number(tr.dataset.upd);
+      try {
+        if (act === 'apply-upd') {
+          if (!window.confirm('确认用这条申请覆盖原友链？申请里没填的字段会保留原值。')) return;
+          await api(`/api/admin/friends/updates/${uid}/apply`, { method: 'POST' });
+          toast('已覆盖原友链');
+        } else if (act === 'reject-upd') {
+          if (!window.confirm('确认拒绝这条更新申请？原友链不受影响。')) return;
+          await api(`/api/admin/friends/updates/${uid}/reject`, { method: 'POST' });
+          toast('已拒绝');
+        }
+        await Promise.all([loadFriends(), loadMoments()]);
+      } catch (err) {
+        toast(err.message, true);
+      }
+      return;
+    }
+
     const id = Number(tr.dataset.fid);
     const link = friends.find((f) => f.id === id);
     if (!link) return;
-    const act = btn.dataset.fact;
 
     if (act === 'approve') return reviewFriend(id, 'approved');
 
@@ -698,8 +764,22 @@
         await api(`/api/admin/friends/${id}`, { method: 'PUT', body: payload });
         toast('已保存');
       } else {
-        await api('/api/admin/friends', { method: 'POST', body: { ...payload, status: 'approved' } });
-        toast('已添加，正在抓取文章');
+        try {
+          await api('/api/admin/friends', {
+            method: 'POST',
+            body: { ...payload, status: 'approved' },
+          });
+          toast('已添加，正在抓取文章');
+        } catch (err) {
+          if (err.code !== 'DUPLICATE' || !err.existing) throw err;
+          const ex = err.existing;
+          const ok = window.confirm(
+            `「${ex.name || ex.url}」已经在友链里了，是否用当前填写覆盖它的资料？`
+          );
+          if (!ok) throw err;
+          await api(`/api/admin/friends/${ex.id}`, { method: 'PUT', body: payload });
+          toast('已覆盖原有友链');
+        }
       }
       closeFriendEditor();
       await Promise.all([loadFriends(), loadMoments()]);

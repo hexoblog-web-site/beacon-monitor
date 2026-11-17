@@ -171,6 +171,29 @@
     var button = form.querySelector('.bma-btn');
     var msg = form.querySelector('[data-msg]');
 
+    // 输入网址失焦时即时查重，提前告诉用户「该站点已存在」
+    var urlInput = form.querySelector('[name="url"]');
+    if (urlInput) {
+      urlInput.addEventListener('blur', function () {
+        var v = urlInput.value.trim();
+        if (!/^https?:\/\/.+\..+/.test(v)) return;
+        fetch(SERVER + '/api/e/friend-check?url=' + encodeURIComponent(v), {
+          mode: 'cors',
+          credentials: 'omit',
+        })
+          .then(function (r) {
+            return r.json();
+          })
+          .then(function (b) {
+            if (b && b.exists && msg && msg.className.indexOf('is-error') === -1) {
+              msg.className = 'bma-msg';
+              msg.textContent = '该站点已在友链中，提交将申请更新资料';
+            }
+          })
+          .catch(function () {});
+      });
+    }
+
     function fail(text) {
       msg.className = 'bma-msg is-error';
       msg.textContent = text;
@@ -200,6 +223,30 @@
         '</span></div>';
     }
 
+    function post(data, overwrite) {
+      var payload = {};
+      for (var k in data) {
+        if (Object.prototype.hasOwnProperty.call(data, k)) payload[k] = data[k];
+      }
+      if (overwrite) payload.overwrite = true;
+      return fetch(SERVER + '/api/e/friend-apply', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload),
+        mode: 'cors',
+        credentials: 'omit',
+      }).then(function (res) {
+        return res
+          .json()
+          .catch(function () {
+            return {};
+          })
+          .then(function (body) {
+            return { status: res.status, ok: res.ok, body: body };
+          });
+      });
+    }
+
     form.addEventListener('submit', function (event) {
       event.preventDefault();
       if (button.disabled) return;
@@ -216,21 +263,30 @@
       msg.className = 'bma-msg';
       msg.textContent = '';
 
-      fetch(SERVER + '/api/e/friend-apply', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(data),
-        mode: 'cors',
-        credentials: 'omit',
-      })
-        .then(function (res) {
-          return res.json().then(function (body) {
-            if (!res.ok) throw new Error(body && body.error ? body.error : '提交失败');
-            return body;
-          });
-        })
-        .then(function (body) {
-          done(body && body.message);
+      post(data, false)
+        .then(function (r) {
+          // URL 已存在：先问用户「是否申请更新资料」，确认后再带 overwrite 重提
+          if (r.status === 409 && r.body && r.body.code === 'DUPLICATE') {
+            var ex = r.body.existing || {};
+            var tip =
+              '这个站点已经在友链里了' +
+              (ex.name ? '（' + ex.name + '）' : '') +
+              '\n\n是否申请更新它的资料？站长确认后才会生效。';
+            if (!window.confirm(tip)) {
+              button.disabled = false;
+              button.textContent = '提交申请';
+              msg.className = 'bma-msg';
+              msg.textContent = '已取消';
+              return null;
+            }
+            button.textContent = '提交中…';
+            return post(data, true).then(function (r2) {
+              if (!r2.ok) throw new Error((r2.body && r2.body.error) || '提交失败');
+              done(r2.body && r2.body.message);
+            });
+          }
+          if (!r.ok) throw new Error((r.body && r.body.error) || '提交失败');
+          done(r.body && r.body.message);
         })
         .catch(function (err) {
           button.disabled = false;

@@ -750,13 +750,39 @@ app.post('/api/e/friend-apply', (req, res) => {
   if (engage.hitLimit(`f:${engage.clientIp(req)}`, 5, 10 * 60 * 1000)) {
     return res.status(429).json({ error: '提交太频繁，请十分钟后再试' });
   }
+  const body = req.body || {};
+  const overwrite = body.overwrite === true || body.overwrite === '1' || body.overwrite === 1;
   try {
-    const link = friends.apply(req.body || {}, { ipHash: friendIpHash(req) });
+    const result = friends.apply(body, { ipHash: friendIpHash(req), overwrite });
     // 只回执单号，不回传任何联系方式
-    res.json({ ok: true, id: link.id, message: '已收到，等站长审核' });
+    if (result.kind === 'update') {
+      return res.json({
+        ok: true,
+        kind: 'update',
+        id: result.id,
+        message: '已提交更新申请，站长确认后生效',
+      });
+    }
+    res.json({ ok: true, kind: 'new', id: result.link.id, message: '已收到，等站长审核' });
   } catch (err) {
+    if (err.code === 'DUPLICATE') {
+      return res.status(409).json({
+        code: 'DUPLICATE',
+        error: '该站点已在友链中',
+        existing: err.existing,
+      });
+    }
     res.status(400).json({ error: err.message });
   }
+});
+
+/** 公开查重：前端输入 URL 后可即时判断是否已存在，提示「是否申请更新」 */
+app.get('/api/e/friend-check', (req, res) => {
+  if (engage.hitLimit(`fc:${engage.clientIp(req)}`, 40, 60 * 1000)) {
+    return res.status(429).json({ exists: false });
+  }
+  res.set('cache-control', 'no-store');
+  res.json(friends.publicCheck(String(req.query.url || '')));
 });
 
 app.get('/api/e/friends.json', (req, res) => {
@@ -843,15 +869,20 @@ app.get('/api/admin/friends', requireAdmin, (req, res) => {
   res.set('cache-control', 'no-store');
   res.json({
     links: friends.listLinks(String(req.query.status || '')),
+    updates: friends.listUpdates('pending'),
     stats: friends.stats(),
     siteUrl: db.getSetting('site_url') || '',
   });
 });
 
 app.post('/api/admin/friends', requireAdmin, (req, res) => {
+  const body = req.body || {};
   try {
-    res.json({ link: friends.createLink(req.body || {}) });
+    res.json({ link: friends.createLink(body, { overwrite: body.overwrite === true }) });
   } catch (err) {
+    if (err.code === 'DUPLICATE') {
+      return res.status(409).json({ code: 'DUPLICATE', error: err.message, existing: err.existing });
+    }
     res.status(400).json({ error: err.message });
   }
 });
@@ -875,6 +906,19 @@ app.post('/api/admin/friends/:id/review', requireAdmin, (req, res) => {
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
+});
+
+// 待确认更新：覆盖原友链 / 拒绝
+app.post('/api/admin/friends/updates/:id/apply', requireAdmin, (req, res) => {
+  try {
+    res.json({ link: friends.applyUpdate(req.params.id) });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.post('/api/admin/friends/updates/:id/reject', requireAdmin, (req, res) => {
+  res.json({ ok: friends.rejectUpdate(req.params.id) });
 });
 
 app.post('/api/admin/friends/:id/check', requireAdmin, async (req, res, next) => {

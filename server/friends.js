@@ -78,6 +78,27 @@ CREATE INDEX IF NOT EXISTS idx_friend_post_link ON friend_post (link_id);
   tx();
 })();
 
+// ---------- 待确认更新队列 ----------
+// 同一个 URL 只想改个别字段（头像/简介等）时，不直接覆盖原记录，
+// 而是把「新值」放进这里排队；原友链保持在线，等站长在后台点「覆盖」才真正生效。
+db.exec(`
+CREATE TABLE IF NOT EXISTS friend_link_update (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  link_id    INTEGER NOT NULL,
+  name       TEXT,
+  url        TEXT    NOT NULL,
+  avatar     TEXT,
+  desc       TEXT,
+  email      TEXT,
+  rss        TEXT,
+  note       TEXT,
+  ip_hash    TEXT,
+  status     TEXT    NOT NULL DEFAULT 'pending',
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_friend_link_update_link ON friend_link_update (link_id);
+`);
+
 const STATUSES = ['pending', 'approved', 'rejected'];
 
 // ---------- 通用 ----------
@@ -129,9 +150,56 @@ function getLink(id) {
   return getStmt.get(Number(id)) || null;
 }
 
-function createLink(input) {
+function duplicateError(link) {
+  const err = new Error('这个站点已经在列表里了');
+  err.code = 'DUPLICATE';
+  err.existing = { id: link.id, name: link.name, url: link.url, status: link.status };
+  return err;
+}
+
+function normalizeProvided(input) {
+  return {
+    name: cleanStr(input.name, 40),
+    avatar: cleanStr(input.avatar, 300),
+    desc: cleanStr(input.desc, 120),
+    email: cleanStr(input.email, 120),
+    rss: cleanStr(input.rss, 300),
+    group_name: cleanStr(input.group_name, 40),
+    note: cleanStr(input.note, 200),
+  };
+}
+
+/** 用输入里的非空字段覆盖已存在友链；空字段保留原值（支持「只改头像」这类局部修改） */
+function mergeIntoLink(id, input) {
+  const cur = getLink(id);
+  if (!cur) throw new Error('友链不存在');
+  const v = normalizeProvided(input);
+  const merged = {
+    id,
+    name: v.name || cur.name,
+    avatar: v.avatar || cur.avatar || null,
+    desc: v.desc || cur.desc || null,
+    email: v.email || cur.email || null,
+    rss: v.rss || cur.rss || null,
+    group_name: v.group_name || cur.group_name || '未分组',
+    note: v.note || cur.note || null,
+  };
+  db.prepare(
+    `UPDATE friend_link
+        SET name = @name, avatar = @avatar, desc = @desc,
+            email = @email, rss = @rss, group_name = @group_name, note = @note
+      WHERE id = @id`
+  ).run(merged);
+  return getLink(id);
+}
+
+function createLink(input, { overwrite = false } = {}) {
   const url = normalizeSiteUrl(input.url);
-  if (getByUrlStmt.get(url)) throw new Error('这个站点已经在列表里了');
+  const existing = getByUrlStmt.get(url);
+  if (existing) {
+    if (!overwrite) throw duplicateError(existing);
+    return mergeIntoLink(existing.id, input);
+  }
 
   const row = {
     name: cleanStr(input.name, 40) || new URL(url).host,
@@ -187,8 +255,13 @@ function deleteLink(id) {
   return db.prepare('DELETE FROM friend_link WHERE id = ?').run(Number(id)).changes > 0;
 }
 
-/** 公开申请：落一个 pending 单子，不做任何自动通过 */
-function apply(input, { ipHash } = {}) {
+/**
+ * 公开申请：
+ *  - URL 不存在 → 落一个 pending 新单子；
+ *  - URL 已存在但未确认覆盖 → 抛 DUPLICATE（前端弹「是否申请更新」）；
+ *  - URL 已存在且确认覆盖 → 写入待确认更新队列，原友链保持在线，等站长确认。
+ */
+function apply(input, { ipHash, overwrite = false } = {}) {
   const name = cleanStr(input.name, 40);
   if (name.length < 2) throw new Error('站点名称太短');
   const url = normalizeSiteUrl(input.url);
@@ -196,7 +269,28 @@ function apply(input, { ipHash } = {}) {
   const email = cleanStr(input.email, 120);
   if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new Error('邮箱格式不正确');
 
-  if (getByUrlStmt.get(url)) throw new Error('这个站点已经提交过了');
+  const existing = getByUrlStmt.get(url);
+  if (existing) {
+    if (!overwrite) throw duplicateError(existing);
+    const info = db
+      .prepare(
+        `INSERT INTO friend_link_update (link_id, name, url, avatar, desc, email, rss, note, ip_hash, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`
+      )
+      .run(
+        existing.id,
+        name,
+        url,
+        cleanStr(input.avatar, 300) || null,
+        cleanStr(input.desc, 120) || null,
+        email || null,
+        cleanStr(input.rss, 300) || null,
+        cleanStr(input.note, 200) || null,
+        ipHash || null,
+        Date.now()
+      );
+    return { kind: 'update', id: info.lastInsertRowid, target: existing };
+  }
 
   const recent = ipHash
     ? db
@@ -222,7 +316,82 @@ function apply(input, { ipHash } = {}) {
       Date.now()
     );
 
-  return getLink(info.lastInsertRowid);
+  return { kind: 'new', link: getLink(info.lastInsertRowid) };
+}
+
+// ---------- 待确认更新：查 / 列 / 覆盖 / 拒绝 ----------
+
+/** 公开查重：只回是否已存在 + 站点名，不泄露邮箱等隐私 */
+function publicCheck(rawUrl) {
+  let url;
+  try {
+    url = normalizeSiteUrl(rawUrl);
+  } catch {
+    return { exists: false };
+  }
+  const link = getByUrlStmt.get(url);
+  if (!link) return { exists: false };
+  return { exists: true, name: link.name, status: link.status };
+}
+
+/** 后台列表用：带出原友链的旧值，方便对比 */
+function listUpdates(status = 'pending') {
+  return db
+    .prepare(
+      `SELECT u.*,
+              l.name   AS target_name,
+              l.url    AS target_url,
+              l.avatar AS target_avatar,
+              l.desc   AS target_desc,
+              l.rss    AS target_rss,
+              l.status AS target_status
+         FROM friend_link_update u
+         LEFT JOIN friend_link l ON l.id = u.link_id
+        WHERE u.status = ?
+        ORDER BY u.created_at DESC`
+    )
+    .all(status);
+}
+
+/** 后台「覆盖」：把更新申请里的非空字段写回原友链，然后删掉申请 */
+function applyUpdate(id) {
+  const u = db.prepare('SELECT * FROM friend_link_update WHERE id = ?').get(Number(id));
+  if (!u) throw new Error('更新申请不存在');
+  const target = getLink(u.link_id);
+  if (!target) throw new Error('原友链已被删除');
+
+  const keep = (v, fallback) => (v != null && String(v).trim() !== '' ? v : fallback);
+  const merged = {
+    id: target.id,
+    name: keep(u.name, target.name),
+    avatar: keep(u.avatar, target.avatar) || null,
+    desc: keep(u.desc, target.desc) || null,
+    email: keep(u.email, target.email) || null,
+    rss: keep(u.rss, target.rss) || null,
+    group_name: target.group_name || '未分组',
+    note: target.note || null,
+  };
+
+  db.transaction(() => {
+    db.prepare(
+      `UPDATE friend_link
+          SET name = @name, avatar = @avatar, desc = @desc,
+              email = @email, rss = @rss, group_name = @group_name, note = @note
+        WHERE id = @id`
+    ).run(merged);
+    db.prepare('DELETE FROM friend_link_update WHERE id = ?').run(Number(id));
+  })();
+
+  return getLink(target.id);
+}
+
+/** 后台「拒绝」：直接删掉这条更新申请，原友链不受影响 */
+function rejectUpdate(id) {
+  return (
+    db
+      .prepare("DELETE FROM friend_link_update WHERE id = ? AND status = 'pending'")
+      .run(Number(id)).changes > 0
+  );
 }
 
 function review(id, status, note) {
@@ -496,7 +665,10 @@ function stats() {
   const broken = db
     .prepare("SELECT COUNT(*) AS n FROM friend_link WHERE status = 'approved' AND feed_state = 'error'")
     .get().n;
-  return { pending, approved, posts, broken };
+  const updates = db
+    .prepare("SELECT COUNT(*) AS n FROM friend_link_update WHERE status = 'pending'")
+    .get().n;
+  return { pending, approved, posts, broken, updates };
 }
 
 module.exports = {
@@ -506,6 +678,10 @@ module.exports = {
   updateLink,
   deleteLink,
   apply,
+  publicCheck,
+  listUpdates,
+  applyUpdate,
+  rejectUpdate,
   review,
   check,
   fetchAll,
