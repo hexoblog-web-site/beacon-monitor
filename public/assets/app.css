@@ -702,3 +702,42 @@ html[data-embed="1"] body { background: transparent; }
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
 }
+
+/* ---------- 计划维护 ---------- */
+
+.pill-maintenance {
+  background: rgba(37, 99, 235, 0.1);
+  color: #2563eb;
+}
+html[data-theme="dark"] .pill-maintenance {
+  background: rgba(96, 165, 250, 0.16);
+  color: #93c5fd;
+}
+
+.card.is-maint::before { background: #2563eb; }
+
+.hb-bar.maint { background: #93c5fd; opacity: 0.9; }
+html[data-theme="dark"] .hb-bar.maint { background: #3b82f6; }
+
+.maint-note {
+  margin-top: 10px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: rgba(37, 99, 235, 0.08);
+  color: #2563eb;
+  font-size: 12px;
+  line-height: 1.5;
+}
+html[data-theme="dark"] .maint-note {
+  background: rgba(96, 165, 250, 0.12);
+  color: #93c5fd;
+}
+
+.group-count.is-maint {
+  color: #2563eb;
+  background: rgba(37, 99, 235, 0.1);
+}
+html[data-theme="dark"] .group-count.is-maint {
+  color: #93c5fd;
+  background: rgba(96, 165, 250, 0.14);
+}

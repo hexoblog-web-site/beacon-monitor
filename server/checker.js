@@ -85,7 +85,8 @@ const certCache = new Map();
 const certInflight = new Map();
 const CERT_TTL = 6 * 3600 * 1000;
 
-function getCertInfo(rawUrl) {
+function getCertInfo(rawUrl, opts = {}) {
+  const force = Boolean(opts && opts.force);
   let parsed;
   try {
     parsed = new URL(rawUrl);
@@ -96,7 +97,7 @@ function getCertInfo(rawUrl) {
 
   const host = parsed.hostname;
   const cached = certCache.get(host);
-  if (cached && Date.now() - cached.at < CERT_TTL) return Promise.resolve(cached.value);
+  if (!force && cached && Date.now() - cached.at < CERT_TTL) return Promise.resolve(cached.value);
   if (certInflight.has(host)) return certInflight.get(host);
 
   const task = new Promise((resolve) => {

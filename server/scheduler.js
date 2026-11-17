@@ -1,7 +1,17 @@
 'use strict';
 
-const { listMonitors, saveCheck, cleanup, getSetting, getMonitor } = require('./db');
+const {
+  listMonitors,
+  saveCheck,
+  cleanup,
+  getSetting,
+  getMonitor,
+  markDownSince,
+  clearDownSince,
+} = require('./db');
 const { runHttpCheck, getCertInfo } = require('./checker');
+const maintenance = require('./maintenance');
+const notify = require('./notify');
 
 const MAX_CONCURRENT = 6;
 const nextRun = new Map();
@@ -13,13 +23,63 @@ function scheduleNext(monitor, delayMs) {
   nextRun.set(monitor.id, Date.now() + (delayMs != null ? delayMs : interval));
 }
 
+function fire(kind, ctx, monitorId) {
+  notify
+    .dispatch(notify.buildEvent(kind, ctx), { monitorId })
+    .catch((err) => console.warn('[notify] 通知发送失败:', err.message));
+}
+
+/**
+ * 状态变化处理：
+ * - 恢复：只在「上次是故障」时发一次，带中断时长
+ * - 故障：翻转时发一次；持续故障按 alert_repeat_min 重复提醒
+ * - 维护期由调用方拦截，不进入这里
+ */
+function handleResult(monitor, result, prevOk) {
+  const now = result.ts || Date.now();
+
+  if (result.ok) {
+    const wasDown = prevOk === 0;
+    const since = monitor.down_since;
+    clearDownSince(monitor.id);
+    if (wasDown) {
+      const mins = since ? Math.max(1, Math.round((now - since) / 60000)) : null;
+      fire('monitor.up', { monitor, result, mins }, monitor.id);
+    }
+    return;
+  }
+
+  markDownSince(monitor.id, now);
+
+  // 首次检测就失败：不告警，避免新增监控立刻炸一条通知
+  if (prevOk == null) return;
+
+  if (prevOk !== 0) {
+    fire('monitor.down', { monitor, result, mins: 0 }, monitor.id);
+    return;
+  }
+
+  // 持续故障：翻转已完成，按间隔补提醒
+  const repeatMin = Number(getSetting('alert_repeat_min'));
+  if (!Number.isFinite(repeatMin) || repeatMin <= 0) return;
+  const last = notify.lastNotifiedAt(monitor.id, 'monitor.down');
+  if (!last || now - last < repeatMin * 60000) return;
+
+  const since = monitor.down_since;
+  const mins = since ? Math.max(1, Math.round((now - since) / 60000)) : null;
+  fire('monitor.down', { monitor, result, mins, repeat: true }, monitor.id);
+}
+
 async function checkMonitor(monitor, { manual = false } = {}) {
   if (running.has(monitor.id)) return null;
   running.add(monitor.id);
   const prevOk = monitor.last_ok;
   try {
     const result = await runHttpCheck(monitor);
-    saveCheck(monitor.id, result);
+    const mw = maintenance.activeWindowFor(monitor, result.ts);
+
+    // 维护期照常记录，但打标：不告警、不累计故障、不计入可用率
+    saveCheck(monitor.id, result, { inMaint: Boolean(mw) });
     scheduleNext(monitor);
 
     // 预热证书信息缓存（异步，不影响检测结果）
@@ -27,14 +87,13 @@ async function checkMonitor(monitor, { manual = false } = {}) {
       getCertInfo(monitor.url).catch(() => {});
     }
 
-    // 仅在状态发生翻转时通知，避免刷屏
-    if (prevOk != null && Boolean(prevOk) !== Boolean(result.ok)) {
-      notifyStatusChange(monitor, result).catch((err) =>
-        console.warn('[notify] 通知发送失败:', err.message)
-      );
+    if (mw) {
+      clearDownSince(monitor.id);
+    } else {
+      handleResult(monitor, result, prevOk);
     }
 
-    const flag = result.ok ? 'UP  ' : 'DOWN';
+    const flag = mw ? 'MAINT' : result.ok ? 'UP   ' : 'DOWN ';
     console.log(
       `[check] ${flag} ${monitor.name.padEnd(12, ' ')} ${result.latency}ms ` +
         `${result.statusCode ?? '-'}${result.error ? ' ' + result.error : ''}${manual ? ' (手动)' : ''}`
@@ -45,58 +104,6 @@ async function checkMonitor(monitor, { manual = false } = {}) {
     return null;
   } finally {
     running.delete(monitor.id);
-  }
-}
-
-async function notifyStatusChange(monitor, result) {
-  const webhook = (getSetting('webhook_url') || '').trim();
-  if (!webhook) return;
-
-  const recovered = Boolean(result.ok);
-  const title = recovered ? `✅ ${monitor.name} 已恢复` : `🔴 ${monitor.name} 访问异常`;
-  const lines = [
-    recovered ? '服务已恢复正常访问。' : '服务检测失败，请及时处理。',
-    `站点：${monitor.name}`,
-    `地址：${monitor.url}`,
-    `时间：${new Date(result.ts).toLocaleString('zh-CN', { hour12: false })}`,
-    `延迟：${result.latency}ms`,
-    result.error ? `原因：${result.error}` : '',
-  ].filter(Boolean);
-  const body = lines.join('\n');
-
-  let payload;
-  let headers = { 'content-type': 'application/json' };
-
-  if (webhook.includes('qyapi.weixin.qq.com')) {
-    payload = { msgtype: 'text', text: { content: `${title}\n${body}` } };
-  } else if (/api\.day\.app|bark/i.test(webhook)) {
-    payload = { title, body, group: '站点监控', level: recovered ? 'active' : 'timeSensitive' };
-  } else if (webhook.includes('open.feishu.cn')) {
-    payload = { msg_type: 'text', content: { text: `${title}\n${body}` } };
-  } else if (webhook.includes('oapi.dingtalk.com')) {
-    payload = { msgtype: 'text', text: { content: `${title}\n${body}` } };
-  } else {
-    payload = {
-      event: recovered ? 'monitor.recovered' : 'monitor.down',
-      title,
-      body,
-      monitor: { id: monitor.id, name: monitor.name, url: monitor.url },
-      result,
-    };
-  }
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 8000);
-  try {
-    const res = await fetch(webhook, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(payload),
-      signal: controller.signal,
-    });
-    if (!res.ok) console.warn(`[notify] Webhook 返回 ${res.status}`);
-  } finally {
-    clearTimeout(timer);
   }
 }
 
@@ -135,6 +142,8 @@ function start() {
     }
   }, 6 * 3600 * 1000);
   retentionTimer.unref?.();
+
+  maintenance.startWatcher();
 
   console.log('[scheduler] 已启动，最大并发 ' + MAX_CONCURRENT);
 }

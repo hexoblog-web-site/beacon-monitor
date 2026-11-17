@@ -9,6 +9,7 @@
     slow: '响应较慢',
     down: '连接失败',
     pending: '等待检测',
+    maintenance: '计划维护',
   };
 
   const state = {
@@ -111,10 +112,10 @@
     }
     for (const b of bars) {
       const slow = b.latency != null && b.latency > (monitor.slowMs || 5000);
-      const cls = !b.ok ? 'down' : slow ? 'slow' : 'up';
-      const tip = `${fmtTime(b.ts)} · ${b.ok ? '正常' : '异常'}${b.latency ? ' · ' + fmtLatency(b.latency) : ''}${
-        b.code ? ' · HTTP ' + b.code : ''
-      }`;
+      const cls = b.maint ? 'maint' : !b.ok ? 'down' : slow ? 'slow' : 'up';
+      const tip = `${fmtTime(b.ts)} · ${b.maint ? '计划维护' : b.ok ? '正常' : '异常'}${
+        b.latency ? ' · ' + fmtLatency(b.latency) : ''
+      }${b.code ? ' · HTTP ' + b.code : ''}`;
       cells.push(`<i class="hb-bar ${cls}" data-tip="${esc(tip)}"></i>`);
     }
     return `<div class="heartbeat" data-id="${monitor.id}">${cells.join('')}</div>`;
@@ -124,9 +125,19 @@
     const cert = certText(m.certDays);
     const uptimeCls = m.uptime24h == null ? 'dim' : m.uptime24h < 99 ? 'warn' : '';
     const latencyCls = m.status === 'down' ? 'bad' : m.status === 'slow' ? 'warn' : m.latency == null ? 'dim' : '';
+    const cardCls =
+      m.status === 'down'
+        ? ' is-down'
+        : m.status === 'slow'
+          ? ' is-slow'
+          : m.status === 'pending'
+            ? ' is-pending'
+            : m.status === 'maintenance'
+              ? ' is-maint'
+              : '';
 
     return `
-      <article class="card${m.status === 'down' ? ' is-down' : m.status === 'slow' ? ' is-slow' : m.status === 'pending' ? ' is-pending' : ''}" data-id="${m.id}" tabindex="0" role="button" aria-label="${esc(m.name)} ${STATUS_TEXT[m.status] || ''}">
+      <article class="card${cardCls}" data-id="${m.id}" tabindex="0" role="button" aria-label="${esc(m.name)} ${STATUS_TEXT[m.status] || ''}">
         <div class="card-head">
           <div class="card-title">
             <span class="name">${esc(m.name)}</span>
@@ -149,6 +160,7 @@
             <b class="${cert.cls}">${cert.text}</b>
           </div>
         </div>
+        ${m.maintenance && m.maintenance.active ? `<div class="maint-note">🔧 ${esc(m.maintenance.title)} · ${fmtTime(m.maintenance.until)} 结束</div>` : ''}
         ${renderHeartbeat(m)}
         <div class="card-foot">
           <span>${fromNow(m.lastCheck)}</span>
@@ -167,14 +179,19 @@
 
     wrap.innerHTML = data.groups
       .map((g) => {
-        const allOk = g.up === g.total;
+        const maint = g.maintenance || 0;
+        const bad = g.total - g.up - maint;
+        const allOk = bad <= 0 && maint === 0;
+        const countCls = allOk ? 'is-ok' : bad > 0 ? 'is-bad' : 'is-maint';
         return `
           <section class="group">
             <div class="group-head">
               <h2>${esc(g.name)}</h2>
-              <span class="group-count ${allOk ? 'is-ok' : 'is-bad'}">${g.up}/${g.total}</span>
+              <span class="group-count ${countCls}">${g.up}/${g.total}</span>
               <span class="spacer"></span>
-              <span class="group-note">${allOk ? '全部正常' : `${g.total - g.up} 项异常`}</span>
+              <span class="group-note">${
+                allOk ? '全部正常' : bad > 0 ? `${bad} 项异常` : `${maint} 项维护中`
+              }</span>
             </div>
             <div class="cards">${g.monitors.map(renderCard).join('')}</div>
           </section>
@@ -187,6 +204,7 @@
     const { summary, site } = data;
     const hero = $('#hero');
     const down = summary.down;
+    const maint = summary.maintenance || 0;
     const badge = $('#heroBadge');
     const badgeText = $('#heroBadgeText');
 
@@ -199,9 +217,17 @@
       $('#heroTitle').textContent = '还没有配置监控项';
       $('#heroDesc').textContent = '前往管理后台添加你的第一个站点';
     } else if (down === 0) {
-      badgeText.textContent = '实时监控中';
-      $('#heroTitle').textContent = '所有系统运行正常';
-      $('#heroDesc').textContent = '一切就绪 · 所有服务正在被持续检测';
+      badgeText.textContent = maint > 0 ? '计划维护中' : '实时监控中';
+      if (maint > 0 && maint === summary.total) {
+        $('#heroTitle').textContent = '正在计划维护';
+        $('#heroDesc').textContent = `${maint} 项服务处于维护窗口，期间不告警`;
+      } else if (maint > 0) {
+        $('#heroTitle').textContent = '所有系统运行正常';
+        $('#heroDesc').textContent = `${maint} 项服务处于计划维护，其余服务运行正常`;
+      } else {
+        $('#heroTitle').textContent = '所有系统运行正常';
+        $('#heroDesc').textContent = '一切就绪 · 所有服务正在被持续检测';
+      }
     } else {
       badgeText.textContent = '存在异常';
       $('#heroTitle').textContent = '部分服务出现异常';

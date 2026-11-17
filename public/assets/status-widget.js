@@ -34,6 +34,7 @@
     ok: { dot: '#22c55e', ring: 'rgba(34,197,94,.18)' },
     slow: { dot: '#f59e0b', ring: 'rgba(245,158,11,.18)' },
     down: { dot: '#ef4444', ring: 'rgba(239,68,68,.22)' },
+    maintenance: { dot: '#3b82f6', ring: 'rgba(59,130,246,.2)' },
     unknown: { dot: '#c2c7ce', ring: 'rgba(148,163,175,.18)' },
   };
 
@@ -41,6 +42,7 @@
     ok: script.getAttribute('data-text-ok') || '所有业务正常',
     slow: script.getAttribute('data-text-slow') || '部分服务较慢',
     down: script.getAttribute('data-text-down') || '{n} 项服务异常',
+    maintenance: script.getAttribute('data-text-maintenance') || '计划维护中',
     unknown: script.getAttribute('data-text-unknown') || '状态未知',
     pending: script.getAttribute('data-text-pending') || '正在检测',
   };

@@ -615,7 +615,7 @@ https://status.你的域名/apply
 | `SITE_TITLE` | `站点服务状态` | 状态页标题（后台也能改，改后以数据库为准） |
 | `SITE_DESCRIPTION` | `实时监控站点与各项服务的可用性` | 副标题 |
 | `FOOTER_TEXT` | 空 | 页脚一句话 |
-| `WEBHOOK_URL` | 空 | 异常通知地址 |
+| `WEBHOOK_URL` | 空 | 异常通知地址（旧配置，启动时自动迁移为一条通知渠道） |
 | `SEED_MONITORS` | 见 compose | 首次启动写入的监控项 JSON 数组（示例是作者博客，请换成自己的） |
 | `AUTO_UPDATE` | `1` | 自动更新开关；`0` 时只保留手动 `bash update.sh` |
 | `UPDATE_INTERVAL` | `3600` | watchtower 检查间隔（秒） |
@@ -642,15 +642,66 @@ https://status.你的域名/apply
 
 ## 通知
 
-后台「站点设置」填 Webhook，**只在正常 ↔ 异常翻转时**发送（恢复也会推一条）：
+后台「通知渠道」支持多渠道并存，一个渠道一条记录，可分别只订阅**全站 / 某个分组 / 单个监控**；旧版只填一个 `WEBHOOK_URL` 也能用，启动时会自动迁移成一条渠道。
 
-| 渠道 | 地址格式 |
+| 类型 | 需要的配置 |
 | --- | --- |
+| Telegram | Bot Token（@BotFather）+ Chat ID（群组填 `-100…`，频道填 `@name`） |
+| 通用 Webhook | URL；可选自定义 header、`secret`（会加 `X-Beacon-Signature` HMAC 头）、`template` |
 | Bark | `https://api.day.app/你的key` |
 | 企业微信机器人 | `https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx` |
 | 飞书机器人 | `https://open.feishu.cn/open-apis/bot/v2/hook/xxx` |
 | 钉钉机器人 | `https://oapi.dingtalk.com/robot/send?access_token=xxx` |
-| 自定义 | 任意 URL，POST `{ event, title, body, monitor, result }` |
+
+发送策略：
+
+- **状态翻转**时发一次（恢复也发，带中断时长）
+- 持续故障按「持续故障重复提醒」间隔再提醒（默认 30 分钟，设 0 关闭）
+- 每个渠道有**静默期**（默认 300 秒），同监控同类事件不会刷屏
+- 失败自动重试 2 次（4xx 不重试，429 按 `retry_after` 退避），全部结果写进「通知记录」
+
+通用 Webhook 收到的 JSON：
+
+```json
+{
+  "event": "monitor.down",
+  "level": "down",
+  "title": "🔴 博客首页 访问异常",
+  "body": "站点：博客首页\n地址：https://...\n原因：状态码 502 不符合预期",
+  "monitor": { "id": 1, "name": "博客首页", "url": "https://...", "group": "站点" },
+  "result": { "ok": false, "statusCode": 502, "latency": 3821, "error": "..." },
+  "ts": 1763424151000
+}
+```
+
+## 计划维护
+
+后台「计划维护」可建窗口，维护期内：
+
+- **照常检测**（窗口结束时若仍是坏的，能立刻发现并告警）
+- **不发告警**，也不发恢复通知，避免维护噪音
+- 检测结果打 `in_maint` 标记，**不计入 24h/7d/30d 可用率**
+- 状态页显示蓝色「计划维护」，徽章同步变蓝
+
+支持三种范围（全站 / 分组 / 单监控）与四种节奏（一次性 / 每天 / 每周 / 每月）。周期窗口按后台配置的时区展开（默认 `Asia/Shanghai`），不依赖容器 TZ。
+
+```json
+// GET /api/e/maintenance.json —— 博客可以据此挂维护横幅
+{
+  "active": [{ "title": "服务器迁移", "scope": "group", "group_name": "站点",
+               "startsAt": 1763424000000, "endsAt": 1763431200000, "monitorIds": [1, 2, 5] }],
+  "upcoming": [],
+  "updatedAt": 1763424300000
+}
+```
+
+## 证书到期
+
+对每个 https 监控按**域名去重**查证书，剩余天数跨过阈值（默认 `30,14,7,3,1` 天）时提醒一次：
+
+- 同时跨过多档只报**最紧急的那一条**，其余阈值直接标记，不会补发一串
+- 续期后到期时间变晚 → 标记自动清空，重新按新证书提醒
+- 剩余 ≤3 天或已过期升级为「故障」级别；后台「证书」卡片可看全部域名并可「立即检查」
 
 ## 从 Glue 迁移
 

@@ -56,6 +56,77 @@ CREATE TABLE IF NOT EXISTS discovery_ignored (
   url        TEXT PRIMARY KEY,
   created_at INTEGER NOT NULL
 );
+
+-- ---------- 计划维护窗口 ----------
+-- scope: all=全站 / group=某分组 / monitor=单个监控
+-- 一次性窗口写 ends_at；周期窗口写 rrule + duration_min（starts_at 为首次生效时间）
+CREATE TABLE IF NOT EXISTS maintenance_window (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  title        TEXT    NOT NULL DEFAULT '计划维护',
+  scope        TEXT    NOT NULL DEFAULT 'all',
+  group_name   TEXT,
+  monitor_id   INTEGER REFERENCES monitors(id) ON DELETE CASCADE,
+  starts_at    INTEGER NOT NULL,
+  ends_at      INTEGER,
+  duration_min INTEGER,
+  rrule        TEXT,
+  active       INTEGER NOT NULL DEFAULT 1,
+  notify       INTEGER NOT NULL DEFAULT 1,
+  note         TEXT,
+  created_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mw_scope  ON maintenance_window (scope, monitor_id, group_name);
+CREATE INDEX IF NOT EXISTS idx_mw_starts ON maintenance_window (starts_at);
+
+-- ---------- 通知渠道 ----------
+CREATE TABLE IF NOT EXISTS notify_channel (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  name         TEXT    NOT NULL,
+  type         TEXT    NOT NULL DEFAULT 'webhook',
+  config       TEXT    NOT NULL DEFAULT '{}',
+  scope        TEXT    NOT NULL DEFAULT 'all',
+  group_name   TEXT,
+  monitor_id   INTEGER REFERENCES monitors(id) ON DELETE CASCADE,
+  min_level    TEXT    NOT NULL DEFAULT 'info',
+  active       INTEGER NOT NULL DEFAULT 1,
+  cooldown_sec INTEGER NOT NULL DEFAULT 300,
+  created_at   INTEGER NOT NULL,
+  last_ok_at   INTEGER,
+  last_error   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_ch_active ON notify_channel (active);
+
+-- ---------- 通知日志（去重依据 + 审计） ----------
+CREATE TABLE IF NOT EXISTS notification_log (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  channel_id  INTEGER,
+  monitor_id  INTEGER,
+  ref_key     TEXT,
+  kind        TEXT    NOT NULL,
+  level       TEXT    NOT NULL,
+  title       TEXT,
+  body        TEXT,
+  ok          INTEGER NOT NULL DEFAULT 0,
+  status_code INTEGER,
+  error       TEXT,
+  created_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_nlog_monitor ON notification_log (monitor_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_nlog_lookup  ON notification_log (channel_id, kind, ref_key, created_at DESC);
+
+-- ---------- 证书状态（按 host 去重） ----------
+CREATE TABLE IF NOT EXISTS cert_state (
+  host           TEXT PRIMARY KEY,
+  monitor_id     INTEGER,
+  subject        TEXT,
+  issuer         TEXT,
+  expires_at     INTEGER,
+  days           INTEGER,
+  last_check     INTEGER,
+  notified_marks TEXT    NOT NULL DEFAULT '',
+  fail_count     INTEGER NOT NULL DEFAULT 0,
+  last_error     TEXT
+);
 `);
 
 // ---------- 轻量迁移（兼容旧数据库） ----------
@@ -67,9 +138,19 @@ CREATE TABLE IF NOT EXISTS discovery_ignored (
   if (!cols.includes('auto_key')) {
     db.exec('ALTER TABLE monitors ADD COLUMN auto_key TEXT');
   }
+  // 故障起始时间：用于「已持续 N 分钟」文案与重复提醒
+  if (!cols.includes('down_since')) {
+    db.exec('ALTER TABLE monitors ADD COLUMN down_since INTEGER');
+  }
   db.exec(
     'CREATE UNIQUE INDEX IF NOT EXISTS idx_monitors_auto_key ON monitors(auto_key) WHERE auto_key IS NOT NULL'
   );
+
+  // 维护期内产生的检测结果打标，统计可用率时排除
+  const checkCols = db.prepare('PRAGMA table_info(checks)').all().map((c) => c.name);
+  if (!checkCols.includes('in_maint')) {
+    db.exec('ALTER TABLE checks ADD COLUMN in_maint INTEGER NOT NULL DEFAULT 0');
+  }
 })();
 
 const DEFAULT_SETTINGS = {
@@ -78,6 +159,15 @@ const DEFAULT_SETTINGS = {
   footer_text: process.env.FOOTER_TEXT || '',
   webhook_url: process.env.WEBHOOK_URL || '',
   retention_days: '90',
+  // ---- 通知 ----
+  notify_enabled: '1',
+  alert_repeat_min: '30', // 持续故障重复提醒间隔，0=只在翻转时提醒
+  // ---- 证书 ----
+  cert_alert_enabled: '1',
+  cert_alert_days: '30,14,7,3,1',
+  cert_check_hours: '6',
+  // ---- 维护窗口 ----
+  maint_timezone: 'Asia/Shanghai',
 };
 
 const getSettingStmt = db.prepare('SELECT value FROM settings WHERE key = ?');
@@ -179,22 +269,41 @@ function normalizeMonitor(input) {
   };
 }
 
-function saveCheck(monitorId, result) {
+function saveCheck(monitorId, result, opts = {}) {
   const ts = result.ts || Date.now();
   db.prepare(
-    'INSERT INTO checks (monitor_id, ts, ok, code, latency, error) VALUES (?, ?, ?, ?, ?, ?)'
-  ).run(monitorId, ts, result.ok ? 1 : 0, result.statusCode ?? null, result.latency ?? null, result.error || null);
+    'INSERT INTO checks (monitor_id, ts, ok, code, latency, error, in_maint) VALUES (?, ?, ?, ?, ?, ?, ?)'
+  ).run(
+    monitorId,
+    ts,
+    result.ok ? 1 : 0,
+    result.statusCode ?? null,
+    result.latency ?? null,
+    result.error || null,
+    opts.inMaint ? 1 : 0
+  );
   db.prepare(
     'UPDATE monitors SET last_ts = ?, last_ok = ?, last_latency = ?, last_code = ?, last_error = ? WHERE id = ?'
   ).run(ts, result.ok ? 1 : 0, result.latency ?? null, result.statusCode ?? null, result.error || null, monitorId);
   return ts;
 }
 
+// ---------- 故障起点（重复提醒依赖它） ----------
+
+/** 只记第一次，不覆盖已有起点 */
+function markDownSince(monitorId, ts) {
+  db.prepare('UPDATE monitors SET down_since = COALESCE(down_since, ?) WHERE id = ?').run(ts, monitorId);
+}
+
+function clearDownSince(monitorId) {
+  db.prepare('UPDATE monitors SET down_since = NULL WHERE id = ? AND down_since IS NOT NULL').run(monitorId);
+}
+
 // ---------- stats ----------
 
 function heartbeat(monitorId, limit = 60) {
   const rows = db
-    .prepare('SELECT ts, ok, code, latency FROM checks WHERE monitor_id = ? ORDER BY ts DESC LIMIT ?')
+    .prepare('SELECT ts, ok, code, latency, in_maint FROM checks WHERE monitor_id = ? ORDER BY ts DESC LIMIT ?')
     .all(monitorId, limit);
   return rows.reverse();
 }
@@ -205,7 +314,7 @@ function uptimeSince(monitorId, sinceTs) {
       `SELECT COUNT(*) AS total,
               COALESCE(SUM(ok), 0) AS up,
               COALESCE(AVG(CASE WHEN ok = 1 THEN latency END), 0) AS avg_latency
-         FROM checks WHERE monitor_id = ? AND ts >= ?`
+         FROM checks WHERE monitor_id = ? AND ts >= ? AND in_maint = 0`
     )
     .get(monitorId, sinceTs);
   return {
@@ -223,7 +332,7 @@ function history(monitorId, sinceTs, bucketMs) {
               AVG(latency) AS latency,
               SUM(CASE WHEN ok = 1 THEN 1 ELSE 0 END) * 1.0 / COUNT(*) AS uptime,
               COUNT(*) AS total
-         FROM checks WHERE monitor_id = ? AND ts >= ?
+         FROM checks WHERE monitor_id = ? AND ts >= ? AND in_maint = 0
          GROUP BY bucket ORDER BY bucket ASC`
     )
     .all(bucketMs, bucketMs, monitorId, sinceTs)
@@ -238,7 +347,10 @@ function history(monitorId, sinceTs, bucketMs) {
 function cleanup(retentionDays) {
   const days = Math.max(1, Number(retentionDays) || 90);
   const cutoff = Date.now() - days * 86400000;
-  return db.prepare('DELETE FROM checks WHERE ts < ?').run(cutoff).changes;
+  const removed = db.prepare('DELETE FROM checks WHERE ts < ?').run(cutoff).changes;
+  // 通知日志固定留 30 天，够审计、不占空间
+  db.prepare('DELETE FROM notification_log WHERE created_at < ?').run(Date.now() - 30 * 86400000);
+  return removed;
 }
 
 // ---------- 自动发现：忽略名单 ----------
@@ -295,6 +407,8 @@ module.exports = {
   updateMonitor,
   deleteMonitor,
   saveCheck,
+  markDownSince,
+  clearDownSince,
   heartbeat,
   uptimeSince,
   history,

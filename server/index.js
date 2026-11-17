@@ -11,6 +11,9 @@ const { getCertInfo, statusOf } = require('./checker');
 const scheduler = require('./scheduler');
 const discovery = require('./discovery');
 const updater = require('./updater');
+const maintenance = require('./maintenance');
+const notify = require('./notify');
+const certwatch = require('./certwatch');
 const { VERSION } = require('./version');
 
 const PORT = Number(process.env.PORT) || 8080;
@@ -40,6 +43,7 @@ const PUBLIC_API = [
   '/api/e/friends.json',
   '/api/e/link.json',
   '/api/e/moments.json',
+  '/api/e/maintenance.json',
   '/e.js',
   '/e/moments.js',
   '/e/apply.js',
@@ -149,13 +153,19 @@ async function buildPublicMonitor(m, now, withCert = true) {
   const u7 = db.uptimeSince(m.id, now - 7 * 86400000);
   const u30 = db.uptimeSince(m.id, now - 30 * 86400000);
   const cert = withCert ? await getCertInfo(m.url) : null;
+  const mw = maintenance.activeWindowFor(m, now);
+  const rawStatus = statusOf(m);
 
   return {
     id: m.id,
     name: m.name,
     url: m.url,
     group: m.group_name,
-    status: statusOf(m),
+    status: mw ? 'maintenance' : rawStatus,
+    rawStatus,
+    maintenance: mw
+      ? { active: true, title: mw.title, startsAt: mw.occStart, until: mw.occEnd, note: mw.note || null }
+      : null,
     latency: m.last_latency,
     statusCode: m.last_code,
     error: m.last_error,
@@ -173,6 +183,7 @@ async function buildPublicMonitor(m, now, withCert = true) {
       ok: c.ok === 1,
       code: c.code,
       latency: c.latency,
+      maint: c.in_maint === 1,
     })),
   };
 }
@@ -197,6 +208,7 @@ async function buildStatus() {
 
   const up = items.filter((m) => m.status === 'up' || m.status === 'slow').length;
   const down = items.filter((m) => m.status === 'down').length;
+  const maint = items.filter((m) => m.status === 'maintenance').length;
 
   return {
     site: {
@@ -204,11 +216,18 @@ async function buildStatus() {
       description: settings.site_description,
       footer: settings.footer_text,
     },
-    summary: { total: items.length, up, down, unknown: items.length - up - down },
+    summary: {
+      total: items.length,
+      up,
+      down,
+      maintenance: maint,
+      unknown: items.length - up - down - maint,
+    },
     groups: groups.map((g) => ({
       ...g,
       up: g.monitors.filter((m) => m.status === 'up' || m.status === 'slow').length,
       total: g.monitors.length,
+      maintenance: g.monitors.filter((m) => m.status === 'maintenance').length,
     })),
     updatedAt: now,
   };
@@ -229,6 +248,7 @@ const BADGE_COLORS = {
   ok: '#17a34a',
   slow: '#d97706',
   down: '#dc2626',
+  maintenance: '#2563eb',
   idle: '#8b949e',
 };
 
@@ -280,16 +300,21 @@ app.get('/api/badge.svg', (req, res) => {
     value = '未配置';
     color = BADGE_COLORS.idle;
   } else {
-    const statuses = monitors.map(statusOf);
+    const maintMap = maintenance.activeWindowsFor(monitors);
+    const statuses = monitors.map((m) => (maintMap.has(m.id) ? 'maintenance' : statusOf(m)));
     const down = statuses.filter((s) => s === 'down').length;
     const slow = statuses.filter((s) => s === 'slow').length;
     const pending = statuses.filter((s) => s === 'pending').length;
+    const maint = statuses.filter((s) => s === 'maintenance').length;
     if (down > 0) {
       value = onlyId ? '异常' : `${down} 项异常`;
       color = BADGE_COLORS.down;
     } else if (pending === monitors.length) {
       value = '检测中';
       color = BADGE_COLORS.idle;
+    } else if (maint === monitors.length && maint > 0) {
+      value = onlyId ? '维护中' : '计划维护中';
+      color = BADGE_COLORS.maintenance;
     } else if (slow > 0) {
       value = onlyId ? '较慢' : '响应较慢';
       color = BADGE_COLORS.slow;
@@ -310,21 +335,26 @@ app.get('/api/badge.svg', (req, res) => {
 
 function summarize(monitors, onlyId) {
   if (!monitors.length) {
-    return { state: 'unknown', text: onlyId ? '监控不存在' : '暂无监控项', total: 0, up: 0, down: 0, slow: 0 };
+    return { state: 'unknown', text: onlyId ? '监控不存在' : '暂无监控项', total: 0, up: 0, down: 0, slow: 0, maintenance: 0 };
   }
 
-  const statuses = monitors.map(statusOf);
+  const maintMap = maintenance.activeWindowsFor(monitors);
+  const statuses = monitors.map((m) => (maintMap.has(m.id) ? 'maintenance' : statusOf(m)));
   const down = statuses.filter((s) => s === 'down').length;
   const slow = statuses.filter((s) => s === 'slow').length;
   const pending = statuses.filter((s) => s === 'pending').length;
+  const maint = statuses.filter((s) => s === 'maintenance').length;
   const up = statuses.filter((s) => s === 'up' || s === 'slow').length;
-  const base = { total: monitors.length, up, down, slow };
+  const base = { total: monitors.length, up, down, slow, maintenance: maint };
 
   if (down > 0) {
     return { ...base, state: 'down', text: onlyId ? '访问异常' : `${down} 项服务异常` };
   }
   if (pending === monitors.length) {
     return { ...base, state: 'unknown', text: '正在检测' };
+  }
+  if (maint === monitors.length && maint > 0) {
+    return { ...base, state: 'maintenance', text: onlyId ? '计划维护' : '计划维护中' };
   }
   if (slow > 0) {
     return { ...base, state: 'slow', text: onlyId ? '响应较慢' : '部分服务较慢' };
@@ -391,6 +421,7 @@ app.get(['/api/dot.svg', '/dot.svg'], (req, res) => {
     ok: BADGE_COLORS.ok,
     slow: BADGE_COLORS.slow,
     down: BADGE_COLORS.down,
+    maintenance: BADGE_COLORS.maintenance,
   }[summary.state] || BADGE_COLORS.idle;
 
   const text = String(req.query.text || summary.text).slice(0, 24);
@@ -588,19 +619,181 @@ app.put('/api/admin/settings', requireAdmin, (req, res) => {
     'friend_apply_enabled',
     'friend_group_name',
     'friend_group_desc',
+    'notify_enabled',
+    'alert_repeat_min',
+    'cert_alert_enabled',
+    'cert_alert_days',
+    'cert_check_hours',
+    'maint_timezone',
   ];
   for (const key of allowed) {
     if (req.body && Object.prototype.hasOwnProperty.call(req.body, key)) {
       let value = req.body[key];
       if (key === 'retention_days') {
         value = Math.min(3650, Math.max(7, Number(value) || 90));
-      } else if (['stat_enabled', 'stat_show_pv', 'friend_apply_enabled'].includes(key)) {
+      } else if (key === 'alert_repeat_min') {
+        value = Math.min(1440, Math.max(0, Math.round(Number(value) || 0)));
+      } else if (key === 'cert_check_hours') {
+        value = Math.min(168, Math.max(1, Math.round(Number(value) || 6)));
+      } else if (key === 'cert_alert_days') {
+        const list = String(value || '')
+          .split(',')
+          .map((s) => Math.round(Number(String(s).trim())))
+          .filter((n) => Number.isFinite(n) && n > 0 && n <= 3650);
+        value = (list.length ? list : [30, 14, 7, 3, 1]).join(',');
+      } else if (
+        ['stat_enabled', 'stat_show_pv', 'friend_apply_enabled', 'notify_enabled', 'cert_alert_enabled'].includes(key)
+      ) {
         value = value === 0 || value === '0' || value === false ? '0' : '1';
+      } else if (key === 'maint_timezone') {
+        const tz = String(value || '').trim().slice(0, 60);
+        try {
+          new Intl.DateTimeFormat('en-US', { timeZone: tz }).format(new Date());
+          value = tz;
+        } catch {
+          value = 'Asia/Shanghai';
+        }
       }
       db.setSetting(key, String(value ?? '').slice(0, 1000));
     }
   }
+  // 兼容旧配置：改 webhook_url 时同步到迁移出来的渠道
+  try {
+    notify.syncLegacyWebhook();
+  } catch (err) {
+    console.warn('[notify] 同步旧版 Webhook 失败:', err.message);
+  }
   res.json({ settings: db.getSettings() });
+});
+
+// ---------- 维护窗口 ----------
+
+app.get('/api/admin/maintenance', requireAdmin, (req, res) => {
+  res.set('cache-control', 'no-store');
+  res.json({
+    windows: maintenance.listWindows(),
+    timezone: db.getSetting('maint_timezone') || 'Asia/Shanghai',
+    monitors: db.listMonitors(false).map((m) => ({ id: m.id, name: m.name, group: m.group_name })),
+  });
+});
+
+app.post('/api/admin/maintenance', requireAdmin, (req, res) => {
+  try {
+    res.json({ window: maintenance.createWindow(req.body || {}) });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.get('/api/admin/maintenance/preview', requireAdmin, (req, res) => {
+  try {
+    res.json(
+      maintenance.preview({
+        title: req.query.title,
+        scope: req.query.scope,
+        group_name: req.query.group_name,
+        monitor_id: req.query.monitor_id,
+        starts_at: req.query.starts_at,
+        ends_at: req.query.ends_at,
+        duration_min: req.query.duration_min,
+        rrule: req.query.rrule,
+      })
+    );
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.put('/api/admin/maintenance/:id', requireAdmin, (req, res) => {
+  try {
+    res.json({ window: maintenance.updateWindow(req.params.id, req.body || {}) });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.delete('/api/admin/maintenance/:id', requireAdmin, (req, res) => {
+  res.json({ ok: maintenance.deleteWindow(req.params.id) });
+});
+
+// ---------- 通知渠道 ----------
+
+app.get('/api/admin/notify/channels', requireAdmin, (req, res) => {
+  res.set('cache-control', 'no-store');
+  res.json({
+    channels: notify.listChannels(),
+    types: notify.CHANNEL_TYPES,
+    levels: notify.MIN_LEVELS,
+    enabled: db.getSetting('notify_enabled') !== '0',
+  });
+});
+
+app.post('/api/admin/notify/channels', requireAdmin, (req, res) => {
+  try {
+    const channel = notify.createChannel(req.body || {});
+    res.json({ channel: notify.listChannels().find((c) => c.id === channel.id) });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.put('/api/admin/notify/channels/:id', requireAdmin, (req, res) => {
+  try {
+    const channel = notify.updateChannel(req.params.id, req.body || {});
+    res.json({ channel: notify.listChannels().find((c) => c.id === channel.id) });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.delete('/api/admin/notify/channels/:id', requireAdmin, (req, res) => {
+  res.json({ ok: notify.deleteChannel(req.params.id) });
+});
+
+app.post('/api/admin/notify/channels/:id/test', requireAdmin, async (req, res, next) => {
+  try {
+    res.json(await notify.testChannel(req.params.id));
+  } catch (err) {
+    res.status(400).json({ ok: false, error: err.message });
+  }
+});
+
+app.get('/api/admin/notify/logs', requireAdmin, (req, res) => {
+  res.set('cache-control', 'no-store');
+  res.json({
+    logs: notify.listLogs({
+      limit: Number(req.query.limit) || 50,
+      monitorId: req.query.monitor_id ? Number(req.query.monitor_id) : null,
+      kind: req.query.kind ? String(req.query.kind) : null,
+    }),
+  });
+});
+
+// ---------- 证书 ----------
+
+app.get('/api/admin/cert', requireAdmin, (req, res) => {
+  res.set('cache-control', 'no-store');
+  res.json({
+    enabled: db.getSetting('cert_alert_enabled') !== '0',
+    thresholds: certwatch.thresholds(),
+    items: certwatch.listCertState(),
+  });
+});
+
+app.post('/api/admin/cert/check', requireAdmin, async (req, res, next) => {
+  try {
+    res.json(await certwatch.scanCertificates({ force: true }));
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------- 公开：维护窗口（博客可挂横幅） ----------
+
+app.get('/api/e/maintenance.json', (req, res) => {
+  const hours = Math.min(168, Math.max(1, Number(req.query.hours) || 24));
+  res.set('cache-control', 'public, max-age=60');
+  res.json(maintenance.publicWindows(hours));
 });
 
 // ---------- 互动统计（私域）：公开接口只吐数字，明细只走后台 ----------
@@ -971,7 +1164,14 @@ app.use((err, req, res, next) => {
 // ---------- boot ----------
 
 db.ensureSeed();
+// 旧版单 webhook 配置迁移成渠道（幂等，只做一次）
+try {
+  notify.syncLegacyWebhook();
+} catch (err) {
+  console.warn('[notify] 旧版 Webhook 迁移失败:', err.message);
+}
 scheduler.start();
+certwatch.start();
 discovery.start();
 
 // 每 12 小时清一次过期的访客明细，只留计数，不留人

@@ -2,7 +2,7 @@
 
 (() => {
   const $ = (sel) => document.querySelector(sel);
-  const STATUS_TEXT = { up: '正常', slow: '较慢', down: '异常', pending: '待检测' };
+  const STATUS_TEXT = { up: '正常', slow: '较慢', down: '异常', pending: '待检测', maintenance: '维护中' };
   let monitors = [];
   let discoveryInfo = null;
 
@@ -55,7 +55,16 @@
   async function showAdmin() {
     $('#loginView').hidden = true;
     $('#adminView').hidden = false;
-    await Promise.all([loadMonitors(), loadSettings(), loadStats(), loadFriends(), loadMoments()]);
+    await Promise.all([
+      loadMonitors(),
+      loadSettings(),
+      loadStats(),
+      loadFriends(),
+      loadMoments(),
+      loadMaintenance(),
+      loadChannels(),
+      loadCert(),
+    ]);
     await loadDiscovery().catch(() => {});
     loadUpdate().catch(() => {});
   }
@@ -841,6 +850,408 @@
     }
   });
 
+  // ---------- 计划维护 ----------
+
+  let mwInfo = { windows: [], monitors: [] };
+
+  const pad2 = (n) => String(n).padStart(2, '0');
+  const toLocalInput = (ts) => {
+    const d = new Date(ts);
+    return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}T${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+  };
+  const fmtDT = (ts) => {
+    if (!ts) return '—';
+    return new Date(ts).toLocaleString('zh-CN', {
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    });
+  };
+
+  function rruleText(rrule) {
+    const s = String(rrule || '');
+    const freq = (s.match(/FREQ=(\w+)/) || [])[1];
+    const day = (s.match(/BYDAY=(\w+)/) || [])[1];
+    const hour = (s.match(/BYHOUR=(\d+)/) || [])[1] || '0';
+    const minute = (s.match(/BYMINUTE=(\d+)/) || [])[1] || '0';
+    const names = { SU: '日', MO: '一', TU: '二', WE: '三', TH: '四', FR: '五', SA: '六' };
+    const time = `${pad2(hour)}:${pad2(minute)}`;
+    if (freq === 'DAILY') return `每天 ${time}`;
+    if (freq === 'WEEKLY') return `每周${names[day] || '日'} ${time}`;
+    if (freq === 'MONTHLY') return `每月 ${time}`;
+    return '周期';
+  }
+
+  function scopeText(w) {
+    if (w.scope === 'all') return '全站';
+    if (w.scope === 'group') return `分组：${w.group_name || '—'}`;
+    return `监控 #${w.monitor_id}`;
+  }
+
+  async function loadMaintenance() {
+    const data = await api('/api/admin/maintenance');
+    mwInfo = data;
+
+    const groups = [...new Set((data.monitors || []).map((m) => m.group).filter(Boolean))];
+    $('#mwGroupList').innerHTML = groups.map((g) => `<option value="${esc(g)}"></option>`).join('');
+    $('#mwMonitor').innerHTML =
+      '<option value="">选择监控…</option>' +
+      (data.monitors || []).map((m) => `<option value="${m.id}">${esc(m.name)}</option>`).join('');
+
+    if (!$('#mwStart').value) {
+      const start = new Date(Date.now() + 10 * 60000);
+      start.setSeconds(0, 0);
+      const end = new Date(start.getTime() + 60 * 60000);
+      $('#mwStart').value = toLocalInput(start.getTime());
+      $('#mwEnd').value = toLocalInput(end.getTime());
+    }
+
+    renderMaintenance(data.windows || []);
+  }
+
+  function renderMaintenance(list) {
+    const tbody = $('#mwRows');
+    if (!list.length) {
+      tbody.innerHTML = '<tr><td colspan="5" class="table-empty">还没有维护窗口</td></tr>';
+      return;
+    }
+    tbody.innerHTML = list
+      .map((w) => {
+        const state =
+          w.state === 'active'
+            ? '<span class="pill pill-maintenance">进行中</span>'
+            : w.state === 'upcoming'
+              ? '<span class="pill pill-pending">待开始</span>'
+              : '<span class="pill pill-up">已结束</span>';
+        const time = w.rrule
+          ? `${fmtDT(w.starts_at)} 起 · ${rruleText(w.rrule)} · 每次 ${w.duration_min || 60} 分钟`
+          : `${fmtDT(w.starts_at)} ~ ${fmtDT(w.ends_at)}`;
+        return `<tr data-mwid="${w.id}" class="${w.active ? '' : 'row-disabled'}">
+          <td>
+            <div class="cell-name">${esc(w.title)}</div>
+            ${w.note ? `<div class="cell-note">${esc(w.note)}</div>` : ''}
+          </td>
+          <td>${esc(scopeText(w))}</td>
+          <td class="cell-time">${esc(time)}</td>
+          <td>${state}</td>
+          <td class="col-actions">
+            <div class="row-actions">
+              <button class="btn btn-sm" data-mwact="toggle">${w.active ? '停用' : '启用'}</button>
+              <button class="btn btn-sm btn-danger" data-mwact="del">删除</button>
+            </div>
+          </td>
+        </tr>`;
+      })
+      .join('');
+  }
+
+  $('#mwScope').addEventListener('change', () => {
+    const scope = $('#mwScope').value;
+    $('#mwGroupField').hidden = scope !== 'group';
+    $('#mwMonitorField').hidden = scope !== 'monitor';
+  });
+
+  $('#mwRepeat').addEventListener('change', () => {
+    const repeat = $('#mwRepeat').value !== 'none';
+    $('#mwEndField').hidden = repeat;
+    $('#mwDurationField').hidden = !repeat;
+  });
+
+  function mwPayload() {
+    const scope = $('#mwScope').value;
+    const repeat = $('#mwRepeat').value;
+    const startRaw = $('#mwStart').value;
+    if (!startRaw) throw new Error('请选择开始时间');
+
+    const start = new Date(startRaw);
+    if (Number.isNaN(start.getTime())) throw new Error('开始时间格式不正确');
+
+    const payload = {
+      title: $('#mwTitle').value.trim() || '计划维护',
+      scope,
+      group_name: scope === 'group' ? $('#mwGroup').value.trim() : null,
+      monitor_id: scope === 'monitor' ? Number($('#mwMonitor').value) : null,
+      starts_at: start.getTime(),
+      notify: $('#mwNotify').checked,
+      note: $('#mwNote').value.trim(),
+    };
+
+    if (repeat === 'none') {
+      const endRaw = $('#mwEnd').value;
+      if (!endRaw) throw new Error('请选择结束时间');
+      payload.ends_at = new Date(endRaw).getTime();
+    } else {
+      const freq = { daily: 'DAILY', weekly: 'WEEKLY', monthly: 'MONTHLY' }[repeat];
+      const names = ['SU', 'MO', 'TU', 'WE', 'TH', 'FR', 'SA'];
+      let rrule = `FREQ=${freq}`;
+      if (repeat === 'weekly') rrule += `;BYDAY=${names[start.getDay()]}`;
+      if (repeat === 'monthly') rrule += `;BYMONTHDAY=${start.getDate()}`;
+      rrule += `;BYHOUR=${start.getHours()};BYMINUTE=${start.getMinutes()}`;
+      payload.rrule = rrule;
+      payload.duration_min = Number($('#mwDuration').value) || 60;
+    }
+    return payload;
+  }
+
+  $('#mwAddBtn').addEventListener('click', async () => {
+    const btn = $('#mwAddBtn');
+    btn.disabled = true;
+    try {
+      await api('/api/admin/maintenance', { method: 'POST', body: mwPayload() });
+      toast('维护窗口已添加');
+      $('#mwTitle').value = '';
+      $('#mwNote').value = '';
+      await loadMaintenance();
+    } catch (err) {
+      toast(err.message, true);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  $('#mwPreviewBtn').addEventListener('click', async () => {
+    try {
+      const payload = mwPayload();
+      const qs = new URLSearchParams();
+      for (const [k, v] of Object.entries(payload)) if (v != null) qs.set(k, String(v));
+      const data = await api('/api/admin/maintenance/preview?' + qs.toString());
+      const occ = data.occurrences || [];
+      if (!occ.length) return toast('这个规则不会产生任何窗口', true);
+      toast(`共 ${occ.length} 次：${fmtDT(occ[0].start)} ~ ${fmtDT(occ[0].end)}`);
+    } catch (err) {
+      toast(err.message, true);
+    }
+  });
+
+  $('#mwRows').addEventListener('click', async (e) => {
+    const btn = e.target.closest('button[data-mwact]');
+    if (!btn) return;
+    const tr = btn.closest('tr');
+    const id = Number(tr.dataset.mwid);
+    const win = (mwInfo.windows || []).find((w) => w.id === id);
+    if (!win) return;
+
+    try {
+      if (btn.dataset.mwact === 'del') {
+        if (!window.confirm(`删除维护窗口「${win.title}」？`)) return;
+        await api(`/api/admin/maintenance/${id}`, { method: 'DELETE' });
+        toast('已删除');
+      } else {
+        await api(`/api/admin/maintenance/${id}`, { method: 'PUT', body: { active: win.active ? 0 : 1 } });
+        toast(win.active ? '已停用' : '已启用');
+      }
+      await loadMaintenance();
+    } catch (err) {
+      toast(err.message, true);
+    }
+  });
+
+  // ---------- 通知渠道 ----------
+
+  let channels = [];
+
+  async function loadChannels() {
+    const data = await api('/api/admin/notify/channels');
+    channels = data.channels || [];
+    renderChannels();
+    await loadNotifyLogs().catch(() => {});
+  }
+
+  const TYPE_TEXT = {
+    telegram: 'Telegram',
+    webhook: 'Webhook',
+    wecom: '企业微信',
+    feishu: '飞书',
+    dingtalk: '钉钉',
+    bark: 'Bark',
+  };
+
+  function renderChannels() {
+    const tbody = $('#chRows');
+    if (!channels.length) {
+      tbody.innerHTML =
+        '<tr><td colspan="5" class="table-empty">还没有渠道，添加一个 Telegram 或 Webhook 就能收到告警</td></tr>';
+      return;
+    }
+    tbody.innerHTML = channels
+      .map((c) => {
+        const scope =
+          c.scope === 'all' ? '全站' : c.scope === 'group' ? `分组：${c.group_name || '—'}` : `监控 #${c.monitor_id}`;
+        const health = c.last_error
+          ? `<div class="cell-note is-error">${esc(c.last_error)}</div>`
+          : c.last_ok_at
+            ? `<div class="cell-note">${fmtDT(c.last_ok_at)}</div>`
+            : '<div class="cell-note">还没发过</div>';
+        return `<tr data-chid="${c.id}" class="${c.active ? '' : 'row-disabled'}">
+          <td><div class="cell-name">${esc(c.name)}</div>${health}</td>
+          <td>${esc(TYPE_TEXT[c.type] || c.type)}</td>
+          <td>${esc(scope)}</td>
+          <td>${esc(c.min_level === 'down' ? '仅故障' : c.min_level === 'warn' ? '警告+' : '全部')}</td>
+          <td class="col-actions">
+            <div class="row-actions">
+              <button class="btn btn-sm" data-chact="test">测试</button>
+              <button class="btn btn-sm" data-chact="toggle">${c.active ? '停用' : '启用'}</button>
+              <button class="btn btn-sm btn-danger" data-chact="del">删除</button>
+            </div>
+          </td>
+        </tr>`;
+      })
+      .join('');
+  }
+
+  async function loadNotifyLogs() {
+    const { logs } = await api('/api/admin/notify/logs?limit=20');
+    const tbody = $('#chLogRows');
+    if (!logs || !logs.length) {
+      tbody.innerHTML = '<tr><td colspan="4" class="table-empty">还没有通知记录</td></tr>';
+      return;
+    }
+    tbody.innerHTML = logs
+      .map((l) => {
+        const result = l.ok
+          ? '<span class="pill pill-up">成功</span>'
+          : `<span class="pill pill-down">失败</span><div class="cell-note is-error">${esc(l.error || '')}</div>`;
+        return `<tr>
+          <td class="cell-time">${fmtDT(l.created_at)}</td>
+          <td>${esc(l.title || l.kind)}<div class="cell-note">${esc(l.kind)}</div></td>
+          <td>${esc(l.channel_name || '—')}</td>
+          <td>${result}</td>
+        </tr>`;
+      })
+      .join('');
+  }
+
+  $('#chType').addEventListener('change', () => {
+    const isTg = $('#chType').value === 'telegram';
+    document.querySelectorAll('.ch-telegram').forEach((el) => (el.hidden = !isTg));
+    document.querySelectorAll('.ch-url').forEach((el) => (el.hidden = isTg));
+  });
+  $('#chType').dispatchEvent(new Event('change'));
+
+  $('#chAddBtn').addEventListener('click', async () => {
+    const btn = $('#chAddBtn');
+    const type = $('#chType').value;
+    const body = {
+      name: $('#chName').value.trim(),
+      type,
+      config:
+        type === 'telegram'
+          ? { bot_token: $('#chToken').value.trim(), chat_id: $('#chChatId').value.trim() }
+          : { url: $('#chUrl').value.trim() },
+      min_level: $('#chLevel').value,
+      cooldown_sec: Number($('#chCooldown').value) || 300,
+      active: $('#chActive').checked,
+    };
+    btn.disabled = true;
+    try {
+      await api('/api/admin/notify/channels', { method: 'POST', body });
+      toast('渠道已添加，点「测试」验证一下');
+      $('#chName').value = '';
+      $('#chToken').value = '';
+      $('#chChatId').value = '';
+      $('#chUrl').value = '';
+      await loadChannels();
+    } catch (err) {
+      toast(err.message, true);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  $('#chRows').addEventListener('click', async (e) => {
+    const btn = e.target.closest('button[data-chact]');
+    if (!btn) return;
+    const tr = btn.closest('tr');
+    const id = Number(tr.dataset.chid);
+    const channel = channels.find((c) => c.id === id);
+    if (!channel) return;
+
+    const act = btn.dataset.chact;
+    if (act === 'del' && !window.confirm(`删除渠道「${channel.name}」？`)) return;
+
+    btn.disabled = true;
+    try {
+      if (act === 'test') {
+        const res = await api(`/api/admin/notify/channels/${id}/test`, { method: 'POST' });
+        if (res.ok) toast(`发送成功（${res.latencyMs}ms）`);
+        else toast(`发送失败：${res.error}`, true);
+      } else if (act === 'toggle') {
+        await api(`/api/admin/notify/channels/${id}`, { method: 'PUT', body: { active: channel.active ? 0 : 1 } });
+        toast(channel.active ? '已停用' : '已启用');
+      } else {
+        await api(`/api/admin/notify/channels/${id}`, { method: 'DELETE' });
+        toast('已删除');
+      }
+      await loadChannels();
+    } catch (err) {
+      toast(err.message, true);
+      btn.disabled = false;
+    }
+  });
+
+  $('#notifyLogsRefresh').addEventListener('click', () => loadNotifyLogs().catch((e) => toast(e.message, true)));
+
+  // ---------- 证书 ----------
+
+  function renderCert(data) {
+    const tbody = $('#certRows');
+    const items = data.items || [];
+    $('#certCard').dataset.enabled = data.enabled ? '1' : '0';
+    if (!items.length) {
+      tbody.innerHTML = data.enabled
+        ? '<tr><td colspan="5" class="table-empty">还没有巡检结果，点「立即检查」</td></tr>'
+        : '<tr><td colspan="5" class="table-empty">证书提醒已关闭，可在「站点设置」里开启</td></tr>';
+      return;
+    }
+    tbody.innerHTML = items
+      .map((it) => {
+        const days =
+          it.days == null
+            ? '<span class="pill pill-pending">未知</span>'
+            : it.level === 'expired'
+              ? '<span class="pill pill-down">已过期</span>'
+              : it.level === 'critical'
+                ? `<span class="pill pill-down">${it.days} 天</span>`
+                : it.level === 'warn'
+                  ? `<span class="pill pill-slow">${it.days} 天</span>`
+                  : `<span class="pill pill-up">${it.days} 天</span>`;
+        return `<tr>
+          <td><div class="cell-name">${esc(it.host)}</div>${
+            it.last_error ? `<div class="cell-note is-error">${esc(it.last_error)}</div>` : ''
+          }</td>
+          <td>${esc(it.monitor_name || '—')}</td>
+          <td>${days}</td>
+          <td class="cell-time">${it.expires_at ? fmtDT(it.expires_at) : '—'}</td>
+          <td>${esc(it.issuer || '—')}</td>
+        </tr>`;
+      })
+      .join('');
+  }
+
+  async function loadCert() {
+    const data = await api('/api/admin/cert');
+    renderCert(data);
+  }
+
+  $('#certCheckBtn').addEventListener('click', async () => {
+    const btn = $('#certCheckBtn');
+    btn.disabled = true;
+    btn.textContent = '检查中…';
+    try {
+      const res = await api('/api/admin/cert/check', { method: 'POST' });
+      if (res.busy) toast('上一轮还在跑，稍等');
+      else toast(`检查完成 ${res.scanned} 个域名${res.alerted ? `，告警 ${res.alerted} 条` : ''}`);
+      await loadCert();
+    } catch (err) {
+      toast(err.message, true);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '立即检查';
+    }
+  });
+
   // ---------- settings ----------
 
   async function loadSettings() {
@@ -854,6 +1265,11 @@
     $('#statEnabledInput').checked = settings.stat_enabled !== '0';
     $('#statShowPvInput').checked = settings.stat_show_pv !== '0';
     $('#friendApplyInput').checked = settings.friend_apply_enabled !== '0';
+    $('#notifyEnabledInput').checked = settings.notify_enabled !== '0';
+    $('#alertRepeatInput').value = settings.alert_repeat_min ?? 30;
+    $('#certAlertInput').checked = settings.cert_alert_enabled !== '0';
+    $('#certDaysInput').value = settings.cert_alert_days || '30,14,7,3,1';
+    $('#certHoursInput').value = settings.cert_check_hours || 6;
   }
 
   $('#saveSettingsBtn').addEventListener('click', async () => {
@@ -873,6 +1289,11 @@
           stat_enabled: $('#statEnabledInput').checked ? '1' : '0',
           stat_show_pv: $('#statShowPvInput').checked ? '1' : '0',
           friend_apply_enabled: $('#friendApplyInput').checked ? '1' : '0',
+          notify_enabled: $('#notifyEnabledInput').checked ? '1' : '0',
+          alert_repeat_min: Number($('#alertRepeatInput').value) || 0,
+          cert_alert_enabled: $('#certAlertInput').checked ? '1' : '0',
+          cert_alert_days: $('#certDaysInput').value.trim() || '30,14,7,3,1',
+          cert_check_hours: Number($('#certHoursInput').value) || 6,
         },
       });
       toast('设置已保存');

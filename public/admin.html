@@ -397,6 +397,240 @@
           <span>开放友链申请</span>
           <input type="checkbox" id="friendApplyInput" checked />
         </label>
+        <label class="field field-inline">
+          <span>启用异常通知</span>
+          <input type="checkbox" id="notifyEnabledInput" checked />
+        </label>
+        <label class="field">
+          <span>持续故障重复提醒（分钟，0=只提醒一次）</span>
+          <input type="number" id="alertRepeatInput" min="0" max="1440" step="5" />
+        </label>
+        <label class="field field-inline">
+          <span>启用证书到期提醒</span>
+          <input type="checkbox" id="certAlertInput" checked />
+        </label>
+        <label class="field">
+          <span>证书提前提醒天数（逗号分隔）</span>
+          <input type="text" id="certDaysInput" placeholder="30,14,7,3,1" />
+        </label>
+        <label class="field">
+          <span>证书巡检间隔（小时）</span>
+          <input type="number" id="certHoursInput" min="1" max="168" step="1" />
+        </label>
+      </div>
+    </section>
+
+    <!-- 计划维护 -->
+    <section class="settings-card" id="maintenanceCard">
+      <div class="settings-head">
+        <div>
+          <h2>计划维护 <span class="tag-ver">1.4.0</span></h2>
+          <p>维护期内照常检测，但不再告警，也不计入可用率</p>
+        </div>
+        <div class="toolbar-actions">
+          <button class="btn btn-sm" id="mwPreviewBtn" type="button">试算时间</button>
+        </div>
+      </div>
+
+      <div class="form-grid mw-form">
+        <label class="field">
+          <span>标题</span>
+          <input type="text" id="mwTitle" maxlength="40" placeholder="服务器迁移" />
+        </label>
+        <label class="field">
+          <span>范围</span>
+          <select id="mwScope" class="select">
+            <option value="all">全站</option>
+            <option value="group">某个分组</option>
+            <option value="monitor">单个监控</option>
+          </select>
+        </label>
+        <label class="field" id="mwGroupField" hidden>
+          <span>分组名</span>
+          <input type="text" id="mwGroup" maxlength="40" list="mwGroupList" placeholder="站点" />
+          <datalist id="mwGroupList"></datalist>
+        </label>
+        <label class="field" id="mwMonitorField" hidden>
+          <span>监控项</span>
+          <select id="mwMonitor" class="select"></select>
+        </label>
+        <label class="field">
+          <span>开始时间</span>
+          <input type="datetime-local" id="mwStart" />
+        </label>
+        <label class="field" id="mwEndField">
+          <span>结束时间</span>
+          <input type="datetime-local" id="mwEnd" />
+        </label>
+        <label class="field">
+          <span>重复</span>
+          <select id="mwRepeat" class="select">
+            <option value="none">不重复</option>
+            <option value="daily">每天</option>
+            <option value="weekly">每周</option>
+            <option value="monthly">每月</option>
+          </select>
+        </label>
+        <label class="field" id="mwDurationField" hidden>
+          <span>每次持续（分钟）</span>
+          <input type="number" id="mwDuration" min="5" max="10080" step="5" value="60" />
+        </label>
+        <label class="field field-inline">
+          <span>维护开始/结束时发通知</span>
+          <input type="checkbox" id="mwNotify" checked />
+        </label>
+        <label class="field field-full">
+          <span>说明（可选）</span>
+          <input type="text" id="mwNote" maxlength="200" placeholder="迁到新机器，预计 2 小时" />
+        </label>
+      </div>
+      <div class="editor-actions mw-actions">
+        <button class="btn btn-primary" id="mwAddBtn" type="button">添加维护窗口</button>
+      </div>
+
+      <div class="table-scroll">
+        <table class="admin-table">
+          <thead>
+            <tr>
+              <th>标题</th>
+              <th>范围</th>
+              <th>时间</th>
+              <th>状态</th>
+              <th class="col-actions">操作</th>
+            </tr>
+          </thead>
+          <tbody id="mwRows">
+            <tr><td colspan="5" class="table-empty">加载中…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 通知渠道 -->
+    <section class="settings-card" id="notifyCard">
+      <div class="settings-head">
+        <div>
+          <h2>通知渠道 <span class="tag-ver">1.4.0</span></h2>
+          <p>一个渠道一条记录，可分别只订阅全站、某个分组或单个监控</p>
+        </div>
+        <div class="toolbar-actions">
+          <button class="btn btn-sm" id="notifyLogsRefresh" type="button">刷新记录</button>
+        </div>
+      </div>
+
+      <div class="form-grid">
+        <label class="field">
+          <span>名称</span>
+          <input type="text" id="chName" maxlength="40" placeholder="我的 Telegram" />
+        </label>
+        <label class="field">
+          <span>类型</span>
+          <select id="chType" class="select">
+            <option value="telegram">Telegram</option>
+            <option value="webhook">通用 Webhook</option>
+            <option value="wecom">企业微信</option>
+            <option value="feishu">飞书</option>
+            <option value="dingtalk">钉钉</option>
+            <option value="bark">Bark</option>
+          </select>
+        </label>
+        <label class="field ch-telegram">
+          <span>Bot Token</span>
+          <input type="password" id="chToken" placeholder="123456:ABC-DEF…" autocomplete="off" />
+        </label>
+        <label class="field ch-telegram">
+          <span>Chat ID</span>
+          <input type="text" id="chChatId" placeholder="-1001234567890 或 @channel" />
+        </label>
+        <label class="field field-full ch-url">
+          <span>Webhook 地址</span>
+          <input type="url" id="chUrl" placeholder="https://example.com/hook" />
+        </label>
+        <label class="field">
+          <span>最低级别</span>
+          <select id="chLevel" class="select">
+            <option value="info">全部（含恢复/维护）</option>
+            <option value="warn">警告及以上（含证书）</option>
+            <option value="down">仅故障</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>静默期（秒）</span>
+          <input type="number" id="chCooldown" min="30" max="86400" step="30" value="300" />
+        </label>
+        <label class="field field-inline">
+          <span>启用</span>
+          <input type="checkbox" id="chActive" checked />
+        </label>
+      </div>
+      <div class="editor-actions mw-actions">
+        <button class="btn btn-primary" id="chAddBtn" type="button">添加渠道</button>
+      </div>
+
+      <div class="table-scroll">
+        <table class="admin-table">
+          <thead>
+            <tr>
+              <th>名称</th>
+              <th>类型</th>
+              <th>范围</th>
+              <th>最近发送</th>
+              <th class="col-actions">操作</th>
+            </tr>
+          </thead>
+          <tbody id="chRows">
+            <tr><td colspan="5" class="table-empty">加载中…</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="stat-list-head">
+        <h3>通知记录</h3>
+        <span class="friend-note">只保留最近 30 天</span>
+      </div>
+      <div class="table-scroll">
+        <table class="admin-table">
+          <thead>
+            <tr>
+              <th>时间</th>
+              <th>事件</th>
+              <th>渠道</th>
+              <th>结果</th>
+            </tr>
+          </thead>
+          <tbody id="chLogRows">
+            <tr><td colspan="4" class="table-empty">还没有通知记录</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 证书 -->
+    <section class="settings-card" id="certCard">
+      <div class="settings-head">
+        <div>
+          <h2>证书到期 <span class="tag-ver">1.4.0</span></h2>
+          <p>同一域名只查一次；跨过阈值提醒一次，续期后自动重置</p>
+        </div>
+        <div class="toolbar-actions">
+          <button class="btn btn-sm" id="certCheckBtn" type="button">立即检查</button>
+        </div>
+      </div>
+      <div class="table-scroll">
+        <table class="admin-table">
+          <thead>
+            <tr>
+              <th>域名</th>
+              <th>关联监控</th>
+              <th>剩余</th>
+              <th>到期时间</th>
+              <th>签发</th>
+            </tr>
+          </thead>
+          <tbody id="certRows">
+            <tr><td colspan="5" class="table-empty">还在等首轮巡检，可点「立即检查」</td></tr>
+          </tbody>
+        </table>
       </div>
     </section>
 
